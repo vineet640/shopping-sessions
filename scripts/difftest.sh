@@ -6,7 +6,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SIZES="${1:-2000 20000 200000}"
 SEEDS="${2:-1 2 3 4 5 6 7 8}"
-IMPL="${IMPL:-$ROOT/scripts/run_local.sh}"
+IMPL="${IMPL:-$ROOT/scripts/run_rust.sh}"
 PY="$ROOT/.venv/bin/python"
 T="$ROOT/data/difftest"; mkdir -p "$T"
 fail=0

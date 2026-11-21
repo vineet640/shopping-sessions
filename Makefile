@@ -19,14 +19,14 @@ fixtures: build
 
 ## all 36 fixtures natively (fast loop)
 fixtures-local:
-	$(PY) scripts/run_fixtures.py fixtures -- ./scripts/run_local.sh
+	$(PY) scripts/run_fixtures.py fixtures -- ./scripts/run_rust.sh
 
 dev:
 	bin/generate --seed 1 --events 1000000 --clicks 250000 --output data/dev
 
 ## native run on dev + exact diff against the published answer
 check-dev:
-	rm -rf out/dev && ./scripts/run_local.sh data/dev out/dev && cd scripts && ../$(PY) compare.py ../out/dev ../dev-answer
+	rm -rf out/dev && ./scripts/run_rust.sh data/dev out/dev && cd scripts && ../$(PY) compare.py ../out/dev ../dev-answer
 
 ## docker run enforcing the scorer limits on dev, then exact diff
 docker-check: build
