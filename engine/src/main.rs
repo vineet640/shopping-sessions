@@ -565,6 +565,20 @@ impl IdTable {
             overflow: AtomicBool::new(false),
         }
     }
+    /// Prefetch the first probe slot of `k` (hides the cache miss of a later insert).
+    #[inline(always)]
+    fn prefetch(&self, k: Key) {
+        let i = mix(k) as usize & self.mask;
+        let p = self.w.as_ptr().wrapping_add(4 * i) as *const i8;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+        }
+    }
     /// -> (slot, root)
     #[inline]
     fn insert(&self, k: Key, s: &[u8], arena: &mut Vec<u8>, w: usize, newc: &mut usize) -> (u32, u32) {
@@ -686,6 +700,7 @@ struct Chunk {
     fi: usize,
     s: usize,
     e: usize,
+    first: bool,
 }
 
 struct Ctx<'a> {
@@ -707,12 +722,17 @@ fn pbucket(r: u32) -> usize {
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let base = cx.files.b[c.fi].get();
-    let data = &base[c.s..c.e];
+    let (rs, re) = chunk_region(base, c);
+    if re <= rs {
+        return;
+    }
+    let data = &base[rs..re];
     let bend = base.as_ptr() as usize + base.len();
     let avail = |f: &[u8]| bend - f.as_ptr() as usize;
     let ParseOut { arena, evb, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
+            let mut pending: Option<(Ev, Key, &[u8], Key)> = None;
             nlines[0] += for_lines::<7, _>(data, |f| {
                 if f[0].is_empty() {
                     return;
@@ -742,24 +762,25 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 if ok && ing - ts > LATE {
                     ok = false;
                 }
-                let mut root = 0u32;
-                let mut cat = 0u16;
+                let mut e = Ev { klo: k.lo, khi: k.hi, ing, ts: (ts - cx.cws) as u32, root: 0, price, cat: 0, ok };
                 if ok {
-                    root = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).1;
-                    cat = cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat);
+                    // software pipeline: prefetch this row's id slot, finish the previous row's insert
+                    let uk = key_at(f[1], avail(f[1]));
+                    cx.tab.prefetch(uk);
+                    e.cat = cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat);
+                    if let Some((mut pe, puk, pus, pk)) = pending.take() {
+                        pe.root = cx.tab.insert(puk, pus, arena, w, newids).1;
+                        evb[(mix(pk) >> (64 - DB_BITS)) as usize].push(pe);
+                    }
+                    pending = Some((e, uk, f[1], k));
+                } else {
+                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(e);
                 }
-                let b = (mix(k) >> (64 - DB_BITS)) as usize;
-                evb[b].push(Ev {
-                    klo: k.lo,
-                    khi: k.hi,
-                    ing,
-                    ts: (ts - cx.cws) as u32,
-                    root,
-                    price,
-                    cat,
-                    ok,
-                });
             });
+            if let Some((mut pe, puk, pus, pk)) = pending.take() {
+                pe.root = cx.tab.insert(puk, pus, arena, w, newids).1;
+                evb[(mix(pk) >> (64 - DB_BITS)) as usize].push(pe);
+            }
         }
         Kind::Ck => {
             nlines[1] += for_lines::<4, _>(data, |f| {
@@ -893,32 +914,52 @@ fn manifest_ts(text: &str, k: &str) -> i64 {
     parse_ts(rest[a..b].as_bytes(), &mut DateCache::default()).unwrap_or_else(|| panic!("bad manifest ts {k}"))
 }
 
+/// Fixed byte ranges [s, e) of each file's data (after the header line). A chunk owns the lines
+/// that start inside it; parse_chunk snaps the range to line boundaries (in parallel).
 fn make_chunks(files: &Files, paths: &[(Kind, PathBuf)], want: &[Kind]) -> Vec<Chunk> {
     let mut chunks = vec![];
+    let ch = env_usize("SS_CHUNK").unwrap_or(CH).max(1); // override for boundary tests
     for (fi, (kind, _)) in paths.iter().enumerate() {
         if !want.contains(kind) {
             continue;
         }
         let b = files.b[fi].get();
-        let mut s = match memchr::memchr(b'\n', b) {
+        let ds = match memchr::memchr(b'\n', b) {
             Some(i) => i + 1,
             None => continue, // header only (or nothing)
         };
+        let mut s = ds;
         while s < b.len() {
-            let mut e = (s + CH).min(b.len());
-            if e < b.len() {
-                e = match memchr::memchr(b'\n', &b[e..]) {
-                    Some(i) => e + i + 1,
-                    None => b.len(),
-                };
-            }
-            // chunk [s, e) minus its final '\n' (which ends the last line, not starts a new one)
-            let ee = if b[e - 1] == b'\n' { e - 1 } else { e };
-            chunks.push(Chunk { kind: *kind, fi, s, e: ee });
+            let e = (s + ch).min(b.len());
+            chunks.push(Chunk { kind: *kind, fi, s, e, first: s == ds });
             s = e;
         }
     }
     chunks
+}
+
+/// Lines starting in [c.s, c.e) as one region without its terminating '\n'.
+#[inline]
+fn chunk_region(base: &[u8], c: &Chunk) -> (usize, usize) {
+    let start = if c.first {
+        c.s
+    } else {
+        match memchr::memchr(b'\n', &base[c.s - 1..]) {
+            Some(j) => c.s + j,
+            None => return (0, 0),
+        }
+    };
+    if start >= c.e {
+        return (0, 0);
+    }
+    let end = match memchr::memchr(b'\n', &base[c.e - 1..]) {
+        Some(j) => c.e - 1 + j,
+        None => base.len(),
+    };
+    if end <= start {
+        return (0, 0);
+    }
+    (start, end)
 }
 
 fn main() {
