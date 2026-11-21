@@ -15,3 +15,4 @@
 - ID strings are copied into per-thread arenas when first interned: comparing names through the CSV mmaps caused 30 s of page faults under local memory pressure.
 - Dockerfile: dependency-cache layer needs `touch src/main.rs` (COPY keeps the older mtime -> cargo shipped the dummy main). The build now asserts the binary is >1 MB.
 - target-cpu left at the default x86-64 baseline (no SIGILL risk on unknown scorer CPUs).
+- 2026-11-21 16:32 CST: The track page shows our 16:32 CST submission as "5:32 PM" next to a "CST" label (system clock verified vs GitHub Date header). Unclear which clock the "Sun 10:00 AM CST" cutoff uses -> treat the effective cutoff as Sun 09:00 CST: small-speedups-only from 06:00, freeze 07:30, final pushed/selected/logged by 08:45 CST.
