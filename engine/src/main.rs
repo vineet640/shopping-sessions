@@ -22,12 +22,14 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
-const DB_BITS: u32 = 10; // dedup buckets
+const DB_BITS: u32 = 8; // dedup buckets
 const NDB: usize = 1 << DB_BITS;
 const PB_BITS: u32 = 9; // person buckets
 const NPB: usize = 1 << PB_BITS;
 const NO_CAT: u16 = u16::MAX;
 
+static DD_A: AtomicU64 = AtomicU64::new(0);
+static DD_B: AtomicU64 = AtomicU64::new(0);
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 macro_rules! log {
     ($($a:tt)*) => {{
@@ -309,8 +311,7 @@ impl Arenas {
 
 struct IdTable {
     mask: usize,
-    lo: Vec<AtomicU64>,
-    hi: Vec<AtomicU64>,
+    kv: Vec<AtomicU64>, // [2i] = lo, [2i+1] = hi (same cache line)
     ptr: Vec<AtomicU64>,
     len: Vec<std::sync::atomic::AtomicU32>,
     count: AtomicUsize,
@@ -326,8 +327,7 @@ impl IdTable {
         };
         IdTable {
             mask: cap - 1,
-            lo: mk(cap),
-            hi: mk(cap),
+            kv: mk(2 * cap),
             ptr: mk(cap),
             len: {
                 let mut v = std::mem::ManuallyDrop::new(vec![0u32; cap]);
@@ -346,14 +346,14 @@ impl IdTable {
         let mut i = (hi as usize) & self.mask;
         let mut probes = 0usize;
         loop {
-            let mut k = self.lo[i].load(Ordering::Acquire);
+            let mut k = self.kv[2 * i].load(Ordering::Acquire);
             if k == 0 {
-                match self.lo[i].compare_exchange(0, lo, Ordering::AcqRel, Ordering::Acquire) {
+                match self.kv[2 * i].compare_exchange(0, lo, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => {
                         self.ptr[i].store(((w as u64) << 40) | arena.len() as u64, Ordering::Relaxed);
                         self.len[i].store(s.len() as u32, Ordering::Relaxed);
                         arena.extend_from_slice(s);
-                        self.hi[i].store(hi, Ordering::Release);
+                        self.kv[2 * i + 1].store(hi, Ordering::Release);
                         let c = self.count.fetch_add(1, Ordering::Relaxed);
                         if c >= self.limit {
                             self.overflow.store(true, Ordering::Relaxed);
@@ -364,10 +364,10 @@ impl IdTable {
                 }
             }
             if k == lo {
-                let mut h2 = self.hi[i].load(Ordering::Acquire);
+                let mut h2 = self.kv[2 * i + 1].load(Ordering::Acquire);
                 while h2 == 0 {
                     std::hint::spin_loop();
-                    h2 = self.hi[i].load(Ordering::Acquire);
+                    h2 = self.kv[2 * i + 1].load(Ordering::Acquire);
                 }
                 if h2 == hi {
                     return i as u32;
@@ -408,6 +408,8 @@ struct Ck {
     user: u32,
     camp: u16,
     ts: i64,
+    pre: u64,
+    idh: u64,
     id: SPtr,
 }
 
@@ -421,8 +423,18 @@ struct PEv {
 #[derive(Clone, Copy)]
 struct PCk {
     key: u64,
+    pre: u64, // first 8 bytes of click_id, big-endian, zero padded
+    idh: u64, // xxh3_64(click_id): equal => same click (copies are identical)
     camp: u16,
     id: SPtr,
+}
+
+#[inline]
+fn prefix8(s: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = s.len().min(8);
+    b[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(b)
 }
 
 #[derive(Default)]
@@ -532,7 +544,14 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     None => continue,
                 };
                 let user = cx.tab.insert(f[1], &mut out.arena, w);
-                out.cks.push(Ck { user, camp, ts, id: sptr(c.fi, base, f[0]) });
+                out.cks.push(Ck {
+                    user,
+                    camp,
+                    ts,
+                    pre: prefix8(f[0]),
+                    idh: xxhash_rust::xxh3::xxh3_64(f[0]),
+                    id: sptr(c.fi, base, f[0]),
+                });
             }
         }
         Kind::Ln => {
@@ -607,6 +626,8 @@ struct Worker {
     pos: Vec<u32>,
     active: Vec<u16>,
     purch: Vec<(u16, u32)>,
+    ev_buf: Vec<PEv>,
+    ck_buf: Vec<PCk>,
 }
 
 // ---------------------------------------------------------------- main
@@ -628,7 +649,7 @@ fn main() {
     T0.set(Instant::now()).ok();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let nthreads = env_usize("NCPU").unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+    let nthreads = env_usize("NCPU").unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)).clamp(1, 30);
     rayon::ThreadPoolBuilder::new().num_threads(nthreads).build_global().unwrap();
 
     let man = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
@@ -719,10 +740,18 @@ fn main() {
     // big chunks first for balance: events then clicks then links is fine since sizes equal
     let mut cap = (total / 500).next_power_of_two().max(1 << 16);
     let nworkers = nthreads;
+    let ev_bytes: usize = paths.iter().enumerate().filter(|(_, p)| p.0 == Kind::Ev).map(|(i, _)| files.b[i].get().len()).sum();
+    // expected events per (thread, bucket), +25% slack; rows are ~70 bytes
+    let per_bucket = ev_bytes / 70 / nworkers / NDB * 5 / 4 + 16;
     let (tab, outs) = loop {
         let tab = IdTable::new(cap);
         let outs: Vec<Mutex<ParseOut>> = (0..nworkers + 1)
-            .map(|_| Mutex::new(ParseOut { evb: (0..NDB).map(|_| Vec::new()).collect(), ..Default::default() }))
+            .map(|_| {
+                Mutex::new(ParseOut {
+                    evb: (0..NDB).map(|_| Vec::with_capacity(per_bucket)).collect(),
+                    ..Default::default()
+                })
+            })
             .collect();
         {
             let cx = Ctx {
@@ -785,16 +814,21 @@ fn main() {
     let root = parent;
     log!("unions done");
     // person name = byte-wise smallest id in component
-    let mut name: Vec<u32> = (0..cap as u32).collect();
-    for &(a, b) in &links {
+    let name: Vec<std::sync::atomic::AtomicU32> = (0..cap as u32).map(std::sync::atomic::AtomicU32::new).collect();
+    links.par_iter().for_each(|&(a, b)| {
         for x in [a, b] {
             let r = root[x as usize] as usize;
-            let cur = name[r];
-            if cur != x && arenas.s(tab.sptr(x)) < arenas.s(tab.sptr(cur)) {
-                name[r] = x;
+            let sx = arenas.s(tab.sptr(x));
+            let mut cur = name[r].load(Ordering::Relaxed);
+            while cur != x && sx < arenas.s(tab.sptr(cur)) {
+                match name[r].compare_exchange_weak(cur, x, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(c) => cur = c,
+                }
             }
         }
-    }
+    });
+    let name: Vec<u32> = name.into_iter().map(|a| a.into_inner()).collect();
     drop(links);
     log!("union-find done");
 
@@ -811,54 +845,111 @@ fn main() {
 
     // ---- dedup + route events to person buckets
     let evbs: Vec<Vec<Vec<Ev>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.evb)).collect();
+    let per_pb = ev_bytes / 70 / nworkers / NPB * 5 / 4 + 16;
     let routed: Vec<Mutex<Vec<Vec<PEv>>>> =
-        (0..nworkers + 1).map(|_| Mutex::new((0..NPB).map(|_| Vec::new()).collect())).collect();
+        (0..nworkers + 1).map(|_| Mutex::new((0..NPB).map(|_| Vec::with_capacity(per_pb)).collect())).collect();
     let nsurv = AtomicUsize::new(0);
-    (0..NDB).into_par_iter().for_each(|b| {
+    let dd_scratch: Vec<Mutex<Vec<u64>>> = (0..nworkers + 1).map(|_| Mutex::new(Vec::new())).collect();
+    let cks: Vec<Vec<Ck>> = outs.iter_mut().map(|o| std::mem::take(&mut o.cks)).collect();
+    let ck_total: usize = cks.iter().map(|v| v.len()).sum();
+    let per_pbc = ck_total / nworkers / NPB * 5 / 4 + 16;
+    let routed_ck: Vec<Mutex<Vec<Vec<PCk>>>> =
+        (0..nworkers + 1).map(|_| Mutex::new((0..NPB).map(|_| Vec::with_capacity(per_pbc)).collect())).collect();
+    let route_clicks = || {
+        cks.par_iter().flat_map(|v| v.par_chunks(1 << 16)).for_each(|part| {
+            let w = rayon::current_thread_index().unwrap_or(nworkers);
+            let mut r = routed_ck[w].lock().unwrap();
+            for c in part {
+                let p = root[c.user as usize];
+                r[pbucket(p)].push(PCk {
+                    key: ((p as u64) << tbits) | (c.ts - cws) as u64,
+                    pre: c.pre,
+                    idh: c.idh,
+                    camp: c.camp,
+                    id: c.id,
+                });
+            }
+        });
+    };
+    rayon::join(route_clicks, || (0..NDB).into_par_iter().for_each(|b| {
+        // group copies by event_id hash with an L2-sized open-addressing table:
+        // slot = tag32 << 32 | t << 27 | index; keeps the copy with the smallest ingest_ts
+        let t0 = Instant::now();
         let n: usize = evbs.iter().map(|t| t[b].len()).sum();
-        let mut v: Vec<Ev> = Vec::with_capacity(n);
-        for t in &evbs {
-            v.extend_from_slice(&t[b]);
-        }
-        v.sort_unstable_by(|x, y| x.h.cmp(&y.h).then(x.ing.cmp(&y.ing)));
+        let cap = (n * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
         let w = rayon::current_thread_index().unwrap_or(nworkers);
+        let mut tabg = dd_scratch[w].lock().unwrap();
+        tabg.clear();
+        tabg.resize(cap, 0);
+        let tab = &mut *tabg;
+        let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize][b][(s & ((1 << 27) - 1)) as usize] };
+        for (t, part) in evbs.iter().enumerate() {
+            for (k, e) in part[b].iter().enumerate() {
+                let tag = (((e.h >> 32) as u32) | 1) as u64;
+                let me = (tag << 32) | ((t as u64) << 27) | k as u64;
+                let mut i = (e.h as usize) & mask;
+                loop {
+                    let s = tab[i];
+                    if s == 0 {
+                        tab[i] = me;
+                        break;
+                    }
+                    if s >> 32 == tag {
+                        let o = get(s);
+                        if o.h == e.h {
+                            if e.ing < o.ing {
+                                tab[i] = me;
+                            }
+                            break;
+                        }
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+        let t1 = Instant::now();
+        DD_A.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
         let mut r = routed[w].lock().unwrap();
         let mut cnt = 0;
-        let mut i = 0;
-        while i < v.len() {
-            let e = v[i];
-            let mut j = i + 1;
-            while j < v.len() && v[j].h == e.h {
-                j += 1;
+        // second pass in source order (sequential reads): keep a record iff it is its group's winner
+        for (t, part) in evbs.iter().enumerate() {
+            for (k, e) in part[b].iter().enumerate() {
+                if !e.ok {
+                    continue;
+                }
+                let tag = (((e.h >> 32) as u32) | 1) as u64;
+                let me = (tag << 32) | ((t as u64) << 27) | k as u64;
+                let mut i = (e.h as usize) & mask;
+                let win = loop {
+                    let s = tab[i];
+                    if s == me {
+                        break true;
+                    }
+                    if s >> 32 == tag && get(s).h == e.h {
+                        break false;
+                    }
+                    i = (i + 1) & mask;
+                };
+                if win {
+                    let p = root[e.user as usize];
+                    r[pbucket(p)].push(PEv {
+                        key: ((p as u64) << tbits) | (e.ts - cws) as u64,
+                        price: e.price,
+                        cat: e.cat,
+                    });
+                    cnt += 1;
+                }
             }
-            if e.ok {
-                let p = root[e.user as usize];
-                r[pbucket(p)].push(PEv {
-                    key: ((p as u64) << tbits) | (e.ts - cws) as u64,
-                    price: e.price,
-                    cat: e.cat,
-                });
-                cnt += 1;
-            }
-            i = j;
         }
         nsurv.fetch_add(cnt, Ordering::Relaxed);
-    });
-    drop(evbs);
+        DD_B.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }));
+    std::mem::forget(cks);
+    log!("dd build {:.3}s route {:.3}s (thread-sum)", DD_A.load(Ordering::Relaxed) as f64 / 1e9, DD_B.load(Ordering::Relaxed) as f64 / 1e9);
+    std::mem::forget(evbs);
     log!("dedup: {} surviving events", nsurv.load(Ordering::Relaxed));
 
-    let cks: Vec<Vec<Ck>> = outs.iter_mut().map(|o| std::mem::take(&mut o.cks)).collect();
-    let routed_ck: Vec<Mutex<Vec<Vec<PCk>>>> =
-        (0..nworkers + 1).map(|_| Mutex::new((0..NPB).map(|_| Vec::new()).collect())).collect();
-    cks.par_iter().flat_map(|v| v.par_chunks(1 << 16)).for_each(|part| {
-        let w = rayon::current_thread_index().unwrap_or(nworkers);
-        let mut r = routed_ck[w].lock().unwrap();
-        for c in part {
-            let p = root[c.user as usize];
-            r[pbucket(p)].push(PCk { key: ((p as u64) << tbits) | (c.ts - cws) as u64, camp: c.camp, id: c.id });
-        }
-    });
-    drop(cks);
     let routed: Vec<Vec<Vec<PEv>>> = routed.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let routed_ck: Vec<Vec<Vec<PCk>>> = routed_ck.into_iter().map(|m| m.into_inner().unwrap()).collect();
     log!("routed");
@@ -875,6 +966,8 @@ fn main() {
                 pos: vec![0; ncamp],
                 active: vec![],
                 purch: vec![],
+                ev_buf: vec![],
+                ck_buf: vec![],
             })
         })
         .collect();
@@ -885,21 +978,32 @@ fn main() {
     let ud_parts: Vec<Vec<UdRow>> = (0..NPB)
         .into_par_iter()
         .map(|b| {
-            let n: usize = routed.iter().map(|t| t[b].len()).sum();
-            let mut ev: Vec<PEv> = Vec::with_capacity(n);
+            let w = rayon::current_thread_index().unwrap_or(nworkers);
+            let mut wk = workers[w].lock().unwrap();
+            let wk = &mut *wk;
+            // per-thread scratch buffers, reused across buckets (no fresh-page faults)
+            let mut ev = std::mem::take(&mut wk.ev_buf);
+            let mut ck = std::mem::take(&mut wk.ck_buf);
+            ev.clear();
+            ck.clear();
             for t in &routed {
                 ev.extend_from_slice(&t[b]);
             }
             ev.sort_unstable_by_key(|e| e.key);
-            let m: usize = routed_ck.iter().map(|t| t[b].len()).sum();
-            let mut ck: Vec<PCk> = Vec::with_capacity(m);
             for t in &routed_ck {
                 ck.extend_from_slice(&t[b]);
             }
-            ck.sort_unstable_by(|x, y| x.key.cmp(&y.key).then_with(|| files_r.s(x.id).cmp(files_r.s(y.id))));
-            let w = rayon::current_thread_index().unwrap_or(nworkers);
-            let mut wk = workers[w].lock().unwrap();
-            let wk = &mut *wk;
+            ck.sort_unstable_by(|x, y| {
+                x.key.cmp(&y.key).then_with(|| {
+                    x.pre.cmp(&y.pre).then_with(|| {
+                        if x.idh == y.idh {
+                            std::cmp::Ordering::Equal
+                        } else {
+                            files_r.s(x.id).cmp(files_r.s(y.id))
+                        }
+                    })
+                })
+            });
             let mut rows: Vec<UdRow> = Vec::new();
             let mut i = 0usize;
             let mut cj = 0usize;
@@ -932,11 +1036,13 @@ fn main() {
                 i = iend;
                 cj = cend;
             }
+            wk.ev_buf = ev;
+            wk.ck_buf = ck;
             rows
         })
         .collect();
-    drop(routed);
-    drop(routed_ck);
+    std::mem::forget(routed);
+    std::mem::forget(routed_ck);
     let nud: usize = ud_parts.iter().map(|r| r.len()).sum();
     log!("sessions done: {} user_daily rows", nud);
 
