@@ -21,8 +21,8 @@ for i in 1 2 3; do
   rm -rf /scratch/od; mkdir -p /scratch/od
   t0=$(ns); OUTPUT_DIR=/scratch/od /app/ss; t1=$(ns); echo "### dev run $i wall: $(ms $t0 $t1) ms"
 done
-# generate 10M events into /scratch with the official generator
-t0=$(ns); /app/generate --seed 7 --events 10000000 --clicks 2500000 --output /scratch/g10 >/dev/null 2>&1; t1=$(ns); echo "generate 10M: $(ms $t0 $t1) ms"
+# generate 20M events into /scratch with the official generator
+t0=$(ns); /app/generate --seed 7 --events 20000000 --clicks 5000000 --output /scratch/g10 >/dev/null 2>&1; t1=$(ns); echo "generate 20M: $(ms $t0 $t1) ms"
 du -sh /scratch/g10
 for i in 1 2 3; do
   rm -rf /scratch/o10; mkdir -p /scratch/o10
