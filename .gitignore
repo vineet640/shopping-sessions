@@ -1,0 +1,9 @@
+vendor/
+data/
+bin/
+out/
+target/
+__pycache__/
+*.pyc
+.venv/
+.claude/settings.local.json

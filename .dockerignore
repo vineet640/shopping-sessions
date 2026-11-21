@@ -1,0 +1,10 @@
+vendor/
+data/
+bin/
+out/
+target/
+fixtures/
+dev-answer/
+reference/
+.git
+.venv
