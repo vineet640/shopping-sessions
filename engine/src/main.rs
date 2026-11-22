@@ -195,6 +195,11 @@ impl SmallMap {
         }
         m
     }
+    #[inline(always)]
+    fn prefetch(&self, k: Key) {
+        let i = mix(k) as usize & self.mask;
+        prefetch_ptr(self.keys.as_ptr().wrapping_add(i) as *const i8);
+    }
     #[inline]
     fn get(&self, k: Key) -> Option<u16> {
         let mut i = mix(k) as usize & self.mask;
@@ -208,6 +213,18 @@ impl SmallMap {
             }
             i = (i + 1) & self.mask;
         }
+    }
+}
+
+#[inline(always)]
+fn prefetch_ptr(p: *const i8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
     }
 }
 
@@ -276,9 +293,41 @@ fn p8(b: &[u8]) -> Option<u64> {
 
 #[derive(Default)]
 struct DateCache {
-    k0: u64,
-    k1: u16,
-    day: i64,
+    ybase: i64,
+    days: Vec<i32>, // [(y - ybase) * 372 + (m - 1) * 31 + (d - 1)] = epoch day, or i32::MIN if impossible
+}
+const DC_YEARS: i64 = 6;
+impl DateCache {
+    /// Day table for the years around `ws` (other years take the general path).
+    fn new(ws: i64) -> Self {
+        let ybase = 1970 + ws.div_euclid(DAY) * 400 / 146_097 - 3;
+        let mut days = vec![i32::MIN; (DC_YEARS * 372) as usize];
+        for yi in 0..DC_YEARS {
+            for m in 1..=12i64 {
+                for d in 1..=31i64 {
+                    let y = ybase + yi;
+                    let s = format!("{:04}-{:02}-{:02}", y, m, d);
+                    if let Some(v) = parse_date(s.as_bytes()) {
+                        days[(yi * 372 + (m - 1) * 31 + (d - 1)) as usize] = v as i32;
+                    }
+                }
+            }
+        }
+        DateCache { ybase, days }
+    }
+}
+
+/// 8 ASCII digits? (little-endian word)
+#[inline(always)]
+fn digits8(x: u64) -> bool {
+    (x & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+}
+/// 8 digits -> four 2-digit values in 16-bit lanes (lane 0 = first two characters)
+#[inline(always)]
+fn pairs8(x: u64) -> u64 {
+    let v = x - 0x3030_3030_3030_3030;
+    (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF
 }
 
 /// F1 / F2 / F3 -> epoch ms. None = bad timestamp (F3 beyond i64 included).
@@ -290,26 +339,39 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     }
     if n == 20 || n == 25 {
         if f[4] == b'-' {
-            if f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+            let w0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(f[8..16].try_into().unwrap());
+            let w2 = u32::from_le_bytes(f[16..20].try_into().unwrap()) as u64;
+            if (w0 >> 56) as u8 != b'-' || (w1 >> 16) as u8 != b'T' || (w1 >> 40) as u8 != b':' || w2 as u8 != b':' {
                 return None;
             }
-            let k0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
-            let k1 = u16::from_le_bytes(f[8..10].try_into().unwrap());
-            let day = if k0 == dc.k0 && k1 == dc.k1 && dc.k0 != 0 {
-                dc.day
-            } else {
-                let d = parse_date(f)?;
-                dc.k0 = k0;
-                dc.k1 = k1;
-                dc.day = d;
-                d
-            };
-            let h = d2(f, 11)?;
-            let mi = d2(f, 14)?;
-            let s = d2(f, 17)?;
+            // YYYYMMDD and hhmmss00 as digit words
+            let da = (w0 & 0xFFFF_FFFF) | (((w0 >> 40) & 0xFFFF) << 32) | ((w1 & 0xFFFF) << 48);
+            let ta = ((w1 >> 24) & 0xFFFF) | (((w1 >> 48) & 0xFFFF) << 16) | (((w2 >> 8) & 0xFFFF) << 32) | (0x3030u64 << 48);
+            if !digits8(da) || !digits8(ta) {
+                return None;
+            }
+            let pd = pairs8(da);
+            let pt = pairs8(ta);
+            let y = ((pd & 0xFF) * 100 + ((pd >> 16) & 0xFF)) as i64;
+            let mo = ((pd >> 32) & 0xFF) as i64;
+            let d = ((pd >> 48) & 0xFF) as i64;
+            let h = (pt & 0xFF) as i64;
+            let mi = ((pt >> 16) & 0xFF) as i64;
+            let s = ((pt >> 32) & 0xFF) as i64;
             if h > 23 || mi > 59 || s > 59 {
                 return None;
             }
+            let yi = y - dc.ybase;
+            let day = if (0..DC_YEARS).contains(&yi) && (1..=12).contains(&mo) && (1..=31).contains(&d) && !dc.days.is_empty() {
+                let v = dc.days[(yi * 372 + (mo - 1) * 31 + (d - 1)) as usize];
+                if v == i32::MIN {
+                    return None;
+                }
+                v as i64
+            } else {
+                parse_date(f)?
+            };
             let off = if n == 20 {
                 if f[19] != b'Z' {
                     return None;
@@ -591,15 +653,7 @@ impl IdTable {
     #[inline(always)]
     fn prefetch(&self, k: Key) {
         let i = mix(k) as usize & self.mask;
-        let p = self.w.as_ptr().wrapping_add(4 * i) as *const i8;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-        }
+        prefetch_ptr(self.w.as_ptr().wrapping_add(4 * i) as *const i8);
     }
     /// -> (slot, root)
     #[inline]
@@ -663,22 +717,22 @@ impl IdTable {
 // ---------------------------------------------------------------- records
 
 #[derive(Clone, Copy)]
+/// Dedup record (every well-formed event with an event_id): key, ingest_ts and where its
+/// person-bucket row lives (NONE if the copy is invalid).
 struct Ev {
     klo: u64,
     khi: u64,
     ing: i64,
-    ts: u32, // ms since cws (valid events only)
-    root: u32,
-    price: u32, // 0 unless purchase
-    cat: u16,
-    ok: bool,
+    r: u64, // thread << 56 | person bucket << 40 | index, or NONE
 }
+const NONE: u64 = u64::MAX;
 
 #[derive(Clone, Copy)]
 struct PEv {
     key: u64,
     price: u32,
     cat: u16,
+    dead: bool, // set by dedup when a copy with a smaller ingest_ts exists
 }
 
 #[derive(Clone, Copy)]
@@ -703,6 +757,7 @@ fn be16(s: &[u8]) -> (u64, u64) {
 struct ParseOut {
     arena: Vec<u8>,
     evb: Vec<Vec<Ev>>,
+    pev: Vec<Vec<PEv>>,
     ckb: Vec<Vec<PCk>>,
     links: Vec<(u32, u32)>,
     nlines: [u64; 3],
@@ -735,11 +790,14 @@ struct Ctx<'a> {
     we: i64,
     cws: i64,
     tbits: u32,
+    pshift: u32,
 }
 
 #[inline]
-fn pbucket(r: u32) -> usize {
-    (r.wrapping_mul(0x9E37_79B1) >> (32 - PB_BITS)) as usize
+fn pbucket(r: u32, pshift: u32) -> usize {
+    // top bits of the slot index: slots are hash positions, so buckets are balanced, and the
+    // key's high bits are constant within a bucket (the radix sort skips those digits)
+    (r >> pshift) as usize
 }
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
@@ -751,10 +809,23 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let data = &base[rs..re];
     let bend = base.as_ptr() as usize + base.len();
     let avail = |f: &[u8]| bend - f.as_ptr() as usize;
-    let ParseOut { arena, evb, ckb, links, nlines, newids, dc } = out;
+    let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut pending: Option<(Ev, Key, &[u8], Key)> = None;
+            let mut pending: Option<(Key, i64, u64, u32, Key, Key, &[u8])> = None;
+            let tbits = cx.tbits;
+            macro_rules! finish_ev {
+                ($pp:expr) => {{
+                    let (k, ing, tsr, price, pk, uk, us): (Key, i64, u64, u32, Key, Key, &[u8]) = $pp;
+                    let cat = cx.products.get(pk).unwrap_or(cx.unknown_cat);
+                    let root = cx.tab.insert(uk, us, arena, w, newids).1;
+                    let pb = pbucket(root, cx.pshift);
+                    let v = &mut pev[pb];
+                    let r = ((w as u64) << 56) | ((pb as u64) << 40) | v.len() as u64;
+                    v.push(PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
+                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(Ev { klo: k.lo, khi: k.hi, ing, r });
+                }};
+            }
             nlines[0] += for_lines::<7, _>(data, |f| {
                 if f[0].is_empty() {
                     return;
@@ -784,24 +855,22 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 if ok && ing - ts > LATE {
                     ok = false;
                 }
-                let mut e = Ev { klo: k.lo, khi: k.hi, ing, ts: (ts - cx.cws) as u32, root: 0, price, cat: 0, ok };
                 if ok {
                     // software pipeline: prefetch this row's id slot, finish the previous row's insert
                     let uk = key_at(f[1], avail(f[1]));
                     cx.tab.prefetch(uk);
-                    e.cat = cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat);
-                    if let Some((mut pe, puk, pus, pk)) = pending.take() {
-                        pe.root = cx.tab.insert(puk, pus, arena, w, newids).1;
-                        evb[(mix(pk) >> (64 - DB_BITS)) as usize].push(pe);
+                    let pk = key_at(f[5], avail(f[5]));
+                    cx.products.prefetch(pk);
+                    if let Some(pp) = pending.take() {
+                        finish_ev!(pp);
                     }
-                    pending = Some((e, uk, f[1], k));
+                    pending = Some((k, ing, (ts - cx.cws) as u64, price, pk, uk, f[1]));
                 } else {
-                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(e);
+                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 }
             });
-            if let Some((mut pe, puk, pus, pk)) = pending.take() {
-                pe.root = cx.tab.insert(puk, pus, arena, w, newids).1;
-                evb[(mix(pk) >> (64 - DB_BITS)) as usize].push(pe);
+            if let Some(pp) = pending.take() {
+                finish_ev!(pp);
             }
         }
         Kind::Ck => {
@@ -820,7 +889,7 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 let root = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).1;
                 let (b0, b1) = be16(f[0]);
                 let o = f[0].as_ptr() as usize - base.as_ptr() as usize;
-                ckb[pbucket(root)].push(PCk {
+                ckb[pbucket(root, cx.pshift)].push(PCk {
                     key: ((root as u64) << cx.tbits) | (ts - cx.cws) as u64,
                     b0,
                     b1,
@@ -881,47 +950,100 @@ struct Worker {
     ck_tmp: Vec<PCk>,
     since: Vec<u32>,
     sday: Vec<u16>,
+    hist: Vec<u32>,
 }
 
-/// LSD radix sort by the low `bits` bits of key(x), 11-bit digits; skips constant digits.
-fn radix_sort<T: Copy, F: Fn(&T) -> u64>(v: &mut Vec<T>, tmp: &mut Vec<T>, bits: u32, key: F) {
-    let n = v.len();
+/// Gathers the rows of `srcs` that pass `keep` into `out`, sorted by key (LSD radix, 12-bit
+/// digits, one histogram pass for all digits, constant digits skipped, the first scatter reads
+/// straight from the sources).
+#[allow(clippy::too_many_arguments)]
+fn radix_gather<T: Copy, P: Fn(&T) -> bool, K: Fn(&T) -> u64>(
+    srcs: &[&[T]],
+    keep: P,
+    out: &mut Vec<T>,
+    tmp: &mut Vec<T>,
+    hist: &mut Vec<u32>,
+    bits: u32,
+    key: K,
+) {
+    const D: u32 = 12;
+    const R: usize = 1 << D;
+    let nd = bits.div_ceil(D).max(1) as usize;
+    hist.clear();
+    hist.resize(nd * R, 0);
+    let mut n = 0usize;
+    for s in srcs {
+        for x in s.iter() {
+            if keep(x) {
+                let k = key(x);
+                for d in 0..nd {
+                    hist[d * R + ((k >> (D * d as u32)) as usize & (R - 1))] += 1;
+                }
+                n += 1;
+            }
+        }
+    }
+    out.clear();
     if n < 256 {
-        v.sort_unstable_by_key(|x| key(x));
+        for s in srcs {
+            out.extend(s.iter().filter(|x| keep(x)).copied());
+        }
+        out.sort_unstable_by_key(|x| key(x));
         return;
     }
-    const D: u32 = 11;
-    const R: usize = 1 << D;
+    out.reserve(n);
     tmp.clear();
     tmp.reserve(n);
-    unsafe { tmp.set_len(n) };
-    let mut cnt = vec![0usize; R];
-    let mut shift = 0;
-    while shift < bits {
-        cnt.iter_mut().for_each(|c| *c = 0);
-        for x in v.iter() {
-            cnt[((key(x) >> shift) as usize) & (R - 1)] += 1;
-        }
-        if cnt.iter().any(|&c| c == n) {
-            shift += D;
+    unsafe {
+        out.set_len(n);
+        tmp.set_len(n);
+    }
+    let mut first = true;
+    for d in 0..nd {
+        let h = &mut hist[d * R..(d + 1) * R];
+        if h.iter().any(|&c| c as usize == n) {
             continue;
         }
-        let mut sum = 0;
-        for c in cnt.iter_mut() {
+        let mut sum = 0u32;
+        for c in h.iter_mut() {
             let t = *c;
             *c = sum;
             sum += t;
         }
-        for x in v.iter() {
-            let d = ((key(x) >> shift) as usize) & (R - 1);
-            tmp[cnt[d]] = *x;
-            cnt[d] += 1;
+        let sh = D * d as u32;
+        if first {
+            for s in srcs {
+                for x in s.iter() {
+                    if keep(x) {
+                        let g = (key(x) >> sh) as usize & (R - 1);
+                        out[h[g] as usize] = *x;
+                        h[g] += 1;
+                    }
+                }
+            }
+            first = false;
+        } else {
+            for x in out.iter() {
+                let g = (key(x) >> sh) as usize & (R - 1);
+                tmp[h[g] as usize] = *x;
+                h[g] += 1;
+            }
+            std::mem::swap(out, tmp);
         }
-        std::mem::swap(v, tmp);
-        shift += D;
+    }
+    if first {
+        // every digit constant: all keys equal
+        let mut i = 0;
+        for s in srcs {
+            for x in s.iter() {
+                if keep(x) {
+                    out[i] = *x;
+                    i += 1;
+                }
+            }
+        }
     }
 }
-
 
 // ---------------------------------------------------------------- main
 
@@ -1070,6 +1192,7 @@ fn main() {
     let ck_bytes: usize = paths.iter().enumerate().filter(|(_, p)| p.0 == Kind::Ck).map(|(i, _)| files.b[i].get().len()).sum();
     let nworkers = nthreads;
     let per_db = ev_bytes / 70 / nworkers / NDB * 5 / 4 + 16;
+    let per_pb = ev_bytes / 70 / nworkers / NPB * 5 / 4 + 16;
     let per_pbc = ck_bytes / 45 / nworkers / NPB * 5 / 4 + 16;
 
     let mut cap = (total / 600).next_power_of_two().max(1 << 16);
@@ -1081,7 +1204,9 @@ fn main() {
             .map(|_| {
                 Mutex::new(ParseOut {
                     evb: (0..NDB).map(|_| Vec::with_capacity(per_db)).collect(),
+                    pev: (0..NPB).map(|_| Vec::with_capacity(per_pb)).collect(),
                     ckb: (0..NPB).map(|_| Vec::with_capacity(per_pbc)).collect(),
+                    dc: DateCache::new(ws),
                     ..Default::default()
                 })
             })
@@ -1096,6 +1221,7 @@ fn main() {
             we,
             cws,
             tbits,
+            pshift: (cap.trailing_zeros()).saturating_sub(PB_BITS),
         };
         // ---- A: links
         link_chunks.par_iter().for_each(|c| {
@@ -1191,16 +1317,29 @@ fn main() {
     log!("parsed: {} event lines, {} click lines, {} link lines; {} ids (cap {})", nl[0], nl[1], nl[2], nids, cap);
     let arenas = Arenas { a: outs.iter_mut().map(|o| std::mem::take(&mut o.arena)).collect() };
 
-    // ---- C: dedup events -> person buckets
+    // ---- C: dedup. One pass per event-id bucket with an L2-sized table; when two copies of an
+    // event meet, the one with the larger ingest_ts (or the later one on a tie: copies with equal
+    // ingest_ts are identical) is killed in place in its person bucket.
     let evbs: Vec<Vec<Vec<Ev>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.evb)).collect();
+    let mut pevs: Vec<Vec<Vec<PEv>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.pev)).collect();
     let ckbs: Vec<Vec<Vec<PCk>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ckb)).collect();
-    let per_pb = ev_bytes / 70 / nworkers / NPB * 5 / 4 + 16;
-    let routed: Vec<Mutex<Vec<Vec<PEv>>>> =
-        (0..nworkers + 1).map(|_| Mutex::new((0..NPB).map(|_| Vec::with_capacity(per_pb)).collect())).collect();
+    struct Ptrs(Vec<Vec<*mut PEv>>);
+    unsafe impl Sync for Ptrs {}
+    unsafe impl Send for Ptrs {}
+    let pptr = Ptrs(pevs.iter_mut().map(|t| t.iter_mut().map(|v| v.as_mut_ptr()).collect()).collect());
+    let pptr = &pptr;
+    let kill = |r: u64| {
+        if r != NONE {
+            let t = (r >> 56) as usize;
+            let pb = ((r >> 40) & 0xFFFF) as usize;
+            let i = (r & ((1 << 40) - 1)) as usize;
+            // distinct copies are distinct rows: no two threads write the same element
+            unsafe { (*pptr.0[t][pb].add(i)).dead = true };
+        }
+    };
     let dd_scratch: Vec<Mutex<Vec<u64>>> = (0..nworkers + 1).map(|_| Mutex::new(Vec::new())).collect();
-    let nsurv = AtomicUsize::new(0);
+    let ndup = AtomicUsize::new(0);
     (0..NDB).into_par_iter().for_each(|b| {
-        // slot = tag32 << 32 | t << 27 | index ; keeps the copy with the smallest ingest_ts
         let n: usize = evbs.iter().map(|t| t[b].len()).sum();
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
@@ -1210,6 +1349,7 @@ fn main() {
         tabg.resize(cap, 0);
         let tab = &mut *tabg;
         let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize][b][(s & ((1 << 27) - 1)) as usize] };
+        let mut dups = 0usize;
         for (t, part) in evbs.iter().enumerate() {
             for (k, e) in part[b].iter().enumerate() {
                 let m = mix(Key { lo: e.klo, hi: e.khi });
@@ -1225,8 +1365,12 @@ fn main() {
                     if s >> 32 == tag {
                         let o = get(s);
                         if o.klo == e.klo && o.khi == e.khi {
+                            dups += 1;
                             if e.ing < o.ing {
+                                kill(o.r);
                                 tab[i] = me;
+                            } else {
+                                kill(e.r);
                             }
                             break;
                         }
@@ -1235,46 +1379,11 @@ fn main() {
                 }
             }
         }
-        let mut r = routed[w].lock().unwrap();
-        let mut cnt = 0;
-        // second pass in source order: keep a record iff it is its group's winner
-        for (t, part) in evbs.iter().enumerate() {
-            for (k, e) in part[b].iter().enumerate() {
-                if !e.ok {
-                    continue;
-                }
-                let m = mix(Key { lo: e.klo, hi: e.khi });
-                let tag = ((m >> 32) | 1) & 0xFFFF_FFFF;
-                let me = (tag << 32) | ((t as u64) << 27) | k as u64;
-                let mut i = m as usize & mask;
-                let win = loop {
-                    let s = tab[i];
-                    if s == me {
-                        break true;
-                    }
-                    if s >> 32 == tag {
-                        let o = get(s);
-                        if o.klo == e.klo && o.khi == e.khi {
-                            break false;
-                        }
-                    }
-                    i = (i + 1) & mask;
-                };
-                if win {
-                    r[pbucket(e.root)].push(PEv {
-                        key: ((e.root as u64) << tbits) | e.ts as u64,
-                        price: e.price,
-                        cat: e.cat,
-                    });
-                    cnt += 1;
-                }
-            }
-        }
-        nsurv.fetch_add(cnt, Ordering::Relaxed);
+        ndup.fetch_add(dups, Ordering::Relaxed);
     });
     std::mem::forget(evbs);
-    log!("dedup: {} surviving events", nsurv.load(Ordering::Relaxed));
-    let routed: Vec<Vec<Vec<PEv>>> = routed.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    log!("dedup: {} duplicate copies", ndup.load(Ordering::Relaxed));
+    let routed = pevs;
 
     // ---- D: per person bucket
     let ws_day = ws.div_euclid(DAY);
@@ -1294,6 +1403,7 @@ fn main() {
                 ck_tmp: vec![],
                 since: vec![0; ncamp],
                 sday: vec![],
+                hist: vec![],
             })
         })
         .collect();
@@ -1311,16 +1421,10 @@ fn main() {
             let wk = &mut *wk;
             let mut ev = std::mem::take(&mut wk.ev_buf);
             let mut ck = std::mem::take(&mut wk.ck_buf);
-            ev.clear();
-            ck.clear();
-            for t in &routed {
-                ev.extend_from_slice(&t[b]);
-            }
-            radix_sort(&mut ev, &mut wk.ev_tmp, kbits, |e| e.key);
-            for t in &ckbs {
-                ck.extend_from_slice(&t[b]);
-            }
-            radix_sort(&mut ck, &mut wk.ck_tmp, kbits, |c| c.key);
+            let esrc: Vec<&[PEv]> = routed.iter().map(|t| &t[b][..]).collect();
+            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits, |e| e.key);
+            let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| &t[b][..]).collect();
+            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits, |c| c.key);
             // equal keys (same person, same ms): order by click_id bytes
             let cmp_id = |x: &PCk, y: &PCk| {
                 (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
@@ -1695,4 +1799,150 @@ fn write_outputs(
     let mut w = ArrowWriter::try_new(f, cd_schema, Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
+}
+
+
+#[cfg(test)]
+mod ts_fuzz {
+    use super::*;
+    #[derive(Default)]
+    struct OldCache {
+        k0: u64,
+        k1: u16,
+        day: i64,
+    }
+    /// previous implementation (reference) -> epoch ms. None = bad timestamp (F3 beyond i64 included).
+    #[inline]
+    fn old_parse_ts(f: &[u8], dc: &mut OldCache) -> Option<i64> {
+        let n = f.len();
+        if n == 0 {
+            return None;
+        }
+        if n == 20 || n == 25 {
+            if f[4] == b'-' {
+                if f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+                    return None;
+                }
+                let k0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
+                let k1 = u16::from_le_bytes(f[8..10].try_into().unwrap());
+                let day = if k0 == dc.k0 && k1 == dc.k1 && dc.k0 != 0 {
+                    dc.day
+                } else {
+                    let d = parse_date(f)?;
+                    dc.k0 = k0;
+                    dc.k1 = k1;
+                    dc.day = d;
+                    d
+                };
+                let h = d2(f, 11)?;
+                let mi = d2(f, 14)?;
+                let s = d2(f, 17)?;
+                if h > 23 || mi > 59 || s > 59 {
+                    return None;
+                }
+                let off = if n == 20 {
+                    if f[19] != b'Z' {
+                        return None;
+                    }
+                    0
+                } else {
+                    let sign = match f[19] {
+                        b'+' => 1,
+                        b'-' => -1,
+                        _ => return None,
+                    };
+                    if f[22] != b':' {
+                        return None;
+                    }
+                    let oh = d2(f, 20)?;
+                    let om = d2(f, 23)?;
+                    if oh > 23 || om > 59 {
+                        return None;
+                    }
+                    sign * (oh * 60 + om) * 60_000
+                };
+                return Some(day * DAY + h * 3_600_000 + mi * 60_000 + s * 1000 - off);
+            }
+        }
+        // F3: digits only
+        let mut i = 0;
+        while i < n && f[i] == b'0' {
+            i += 1;
+        }
+        let r = &f[i..];
+        let m = r.len();
+        if m > 19 {
+            // too long for i64 if all digits; either way bad
+            return None;
+        }
+        let mut v: u64 = 0;
+        let mut j = 0;
+        while j + 8 <= m {
+            v = v * 100_000_000 + p8(&r[j..j + 8])?;
+            j += 8;
+        }
+        while j < m {
+            let c = r[j].wrapping_sub(b'0');
+            if c > 9 {
+                return None;
+            }
+            v = v.wrapping_mul(10).wrapping_add(c as u64);
+            j += 1;
+        }
+        // m <= 19 digits: at most 9_999_999_999_999_999_999 which may exceed u64? no: u64 max ~1.8e19
+        if m == 19 && r[0] > b'1' {
+            // >= 2e18 .. 9.99e18 fits u64; check i64 below
+        }
+        if v > i64::MAX as u64 {
+            return None;
+        }
+        Some(v as i64)
+    }
+
+
+    #[test]
+    fn new_matches_old() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let ws = parse_ts(b"2028-02-20T00:00:00Z", &mut DateCache::default()).unwrap();
+        let mut dc = DateCache::new(ws);
+        let mut oc = OldCache::default();
+        let bases: Vec<String> = vec![
+            "2028-02-29T23:59:59Z".into(), "2027-02-29T10:00:00Z".into(), "2028-12-31T00:00:00+05:30".into(),
+            "2026-01-01T00:00:00-00:00".into(), "2028-03-01T12:34:56-10:00".into(), "1999-07-04T01:02:03Z".into(),
+            "2100-02-29T00:00:00Z".into(), "2028-02-30T00:00:00Z".into(), "1791071890000".into(), "0001791071890000".into(),
+            "2028-04-31T00:00:00Z".into(), "2028-13-01T00:00:00Z".into(), "2028-00-10T00:00:00Z".into(), "2028-01-00T00:00:00Z".into(),
+            "2028-06-15T24:00:00Z".into(), "2028-06-15T23:60:00Z".into(), "2028-06-15T23:00:60Z".into(), "2028-06-15T23:00:00+24:00".into(),
+            "2028-06-15T23:00:00+05:60".into(), "2028-06-15T23:00:00+0500".into(), "2028-06-15 23:00:00Z".into(), "2028-06-15t23:00:00z".into(),
+            "99999999999999999999".into(), "9223372036854775807".into(), "9223372036854775808".into(), "00000000000000000000".into(),
+        ];
+        let alphabet = b"0123456789-T:Z+ zt.e";
+        let mut n = 0;
+        for round in 0..3_000_000u64 {
+            let mut s = bases[(rnd() % bases.len() as u64) as usize].clone().into_bytes();
+            let muts = rnd() % 4;
+            for _ in 0..muts {
+                let op = rnd() % 10;
+                if s.is_empty() { break; }
+                let i = (rnd() % s.len() as u64) as usize;
+                match op {
+                    0..=5 => s[i] = b'0' + (rnd() % 10) as u8,
+                    6 => s[i] = alphabet[(rnd() % alphabet.len() as u64) as usize],
+                    7 => { s.remove(i); }
+                    8 => s.insert(i, b'0' + (rnd() % 10) as u8),
+                    _ => s[i] = (rnd() % 256) as u8,
+                }
+            }
+            let a = parse_ts(&s, &mut dc);
+            let b = old_parse_ts(&s, &mut oc);
+            assert_eq!(a, b, "mismatch on {:?} (round {round})", String::from_utf8_lossy(&s));
+            n += 1;
+        }
+        assert!(n > 0);
+    }
 }
