@@ -33,6 +33,8 @@ const NO_CAT: u16 = u16::MAX;
 const CH: usize = 1 << 20; // parse chunk bytes
 const PF: usize = 8; // rows in flight between id-slot prefetch and insert (hides DRAM latency)
 
+static STATS: AtomicBool = AtomicBool::new(false);
+static SI: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 macro_rules! log {
     ($($a:tt)*) => {{
@@ -1453,6 +1455,7 @@ fn chunk_region(base: &[u8], c: &Chunk) -> (usize, usize) {
 
 fn main() {
     T0.set(Instant::now()).ok();
+    STATS.store(std::env::var_os("SS_STATS").is_some(), Ordering::Relaxed);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let nthreads = env_usize("NCPU")
@@ -1833,6 +1836,8 @@ fn main() {
             }
             let mut ev = std::mem::take(&mut wk.ev_buf);
             let mut ck = std::mem::take(&mut wk.ck_buf);
+            let st = STATS.load(Ordering::Relaxed);
+            let t0 = if st { Some(Instant::now()) } else { None };
             // radix by person only (few varying bits), then sort each person's (small) run by time
             let esrc: Vec<&[PEv]> = routed.iter().map(|t| t.slice(b)).collect();
             radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits - tbits, |e| e.key >> tbits);
@@ -1856,6 +1861,7 @@ fn main() {
                 }
                 q = r;
             }
+            let t1 = if st { Some(Instant::now()) } else { None };
             let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| t.slice(b)).collect();
             radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits - tbits, |c| c.key >> tbits);
             // per person: by time, ties (same ms) by click_id bytes
@@ -1903,6 +1909,7 @@ fn main() {
                 }
                 q = r;
             }
+            let t2 = if st { Some(Instant::now()) } else { None };
             let mut rows: Vec<UdRow> = Vec::new();
             let mut i = 0usize;
             let mut cj = 0usize;
@@ -1937,15 +1944,26 @@ fn main() {
                 i = iend;
                 cj = cend;
             }
+            let t3 = if st { Some(Instant::now()) } else { None };
             wk.ev_buf = ev;
             wk.ck_buf = ck;
             if !rows.is_empty() {
                 let pw = wk.udw.get_or_insert_with(|| ud_writer(&ud_dir, w));
                 ud_write(pw, &rows, arenas_r, catnames_r);
             }
+            if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+                let t4 = Instant::now();
+                for (k, d) in [(0, t1 - t0), (1, t2 - t1), (2, t3 - t2), (3, t4 - t3)] {
+                    SI[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
             rows.len()
         })
         .collect();
+    if STATS.load(Ordering::Relaxed) {
+        let g = |k: usize| SI[k].load(Ordering::Relaxed) as f64 / 1e9;
+        log!("stats sessions thread-s: ev-sort {:.3} ck-sort {:.3} person {:.3} parquet {:.3}", g(0), g(1), g(2), g(3));
+    }
     std::mem::forget(routed);
     std::mem::forget(ckbs);
     let nud: usize = ud_parts.iter().sum();
