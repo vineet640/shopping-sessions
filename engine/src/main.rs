@@ -456,24 +456,31 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
         // too long for i64 if all digits; either way bad
         return None;
     }
-    let mut v: u64 = 0;
-    let mut j = 0;
-    while j + 8 <= m {
-        v = v * 100_000_000 + p8(&r[j..j + 8])?;
-        j += 8;
-    }
-    while j < m {
-        let c = r[j].wrapping_sub(b'0');
-        if c > 9 {
-            return None;
+    let v: u64 = if (9..=16).contains(&m) {
+        // two overlapping 8-digit SWAR loads cover every digit (typical 13-digit epoch ms)
+        const P10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+        let hi = p8(&r[..8])?;
+        let lo = p8(&r[m - 8..])?;
+        let k = m - 8;
+        hi * P10[k] + lo % P10[k]
+    } else {
+        let mut v: u64 = 0;
+        let mut j = 0;
+        while j + 8 <= m {
+            v = v * 100_000_000 + p8(&r[j..j + 8])?;
+            j += 8;
         }
-        v = v.wrapping_mul(10).wrapping_add(c as u64);
-        j += 1;
-    }
-    // m <= 19 digits: at most 9_999_999_999_999_999_999 which may exceed u64? no: u64 max ~1.8e19
-    if m == 19 && r[0] > b'1' {
-        // >= 2e18 .. 9.99e18 fits u64; check i64 below
-    }
+        while j < m {
+            let c = r[j].wrapping_sub(b'0');
+            if c > 9 {
+                return None;
+            }
+            v = v.wrapping_mul(10).wrapping_add(c as u64);
+            j += 1;
+        }
+        v
+    };
+    // m <= 19 digits: at most 9_999_999_999_999_999_999 < u64::MAX; i64 range checked below
     if v > i64::MAX as u64 {
         return None;
     }
