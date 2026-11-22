@@ -43,3 +43,4 @@
 - 2026-11-21 21:58 CST: Tried simdjson-style bit flattening in the tokenizer: slower (31 vs 28.6 ns/line), reverted.
 - 2026-11-21 22:00 CST: Diag v4: same-machine run-to-run spread ~10%; parse .78 s (events ~255 ns/line/thread), sessions .235 s (ev-sort .68, person .56, parquet .29, ck-sort .25 thread-s). Next: sessions ev-sort and person; event-parse instruction cuts. Use the A/B diag (v5) to judge changes below ~10%.
 - 2026-11-21 22:13 CST: A/B harness works: same machine, base f9eff02 1238/1252/1283 ms vs 14655d0 1182/1186 ms (-6%). So BB-EFA45B22's 1.4476 was machine noise. Use A/B diags to validate before trusting single scores.
+- 2026-11-21 22:22 CST: Tokenizer: virtual newline ends the last line -> single call site for the per-line closure (inlinable); parse wall ~-4% locally. NOT yet submitted (next candidate after BB-F8DBAF42 = 43108d9).

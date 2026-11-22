@@ -602,61 +602,27 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
     // Structural iteration over ',' and '\n' only; quotes are counted per line with popcount and
     // validated at the end of the line: a line is well-formed iff every field that starts with '"'
     // is >= 2 bytes and ends with '"', and the line holds exactly 2 quotes per such field (so no
-    // quote appears anywhere else).
+    // quote appears anywhere else). A virtual '\n' at data.len() ends the last line, so there is
+    // a single place that calls `f` (lets the compiler inline the per-line closure).
     let mut bounds = [(0usize, 0usize); N];
     let mut nf = 0usize;
     let mut fstart = 0usize;
     let mut lq = 0u32; // quotes seen in the current line
     let mut lines = 0u64;
-    macro_rules! finish {
-        ($end:expr) => {{
-            let end = $end;
-            lines += 1;
-            if nf + 1 == N {
-                bounds[nf] = (fstart, end);
-                let mut fs: [&'a [u8]; N] = [&[]; N];
-                // positions come from the delimiter masks of `data`: always in range, s <= e
-                if lq == 0 {
-                    for k in 0..N {
-                        fs[k] = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
-                    }
-                    f(&fs);
-                } else {
-                    let mut ok = true;
-                    let mut qf = 0u32;
-                    for k in 0..N {
-                        let v = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
-                        if !v.is_empty() && v[0] == b'"' {
-                            let l = v.len();
-                            if l < 2 || v[l - 1] != b'"' {
-                                ok = false;
-                                break;
-                            }
-                            qf += 1;
-                            fs[k] = &v[1..l - 1];
-                        } else {
-                            fs[k] = v;
-                        }
-                    }
-                    if ok && qf * 2 == lq {
-                        f(&fs);
-                    }
-                }
-            }
-            nf = 0;
-            lq = 0;
-            fstart = end + 1;
-        }};
-    }
     let n = data.len();
+    if n == 0 {
+        return 0;
+    }
     let mut blk = 0usize;
     let mut tail = [0u8; 64];
-    while blk < n {
+    while blk <= n {
         let (sm, nlm, qm) = if blk + 64 <= n {
             delim_masks(&data[blk..blk + 64])
         } else {
+            // last block: the remaining bytes plus the virtual newline at index n
             tail = [0u8; 64];
             tail[..n - blk].copy_from_slice(&data[blk..]);
+            tail[n - blk] = b'\n';
             delim_masks(&tail)
         };
         let mut s = sm;
@@ -676,16 +642,48 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
                 let below = (1u64 << i) - 1;
                 lq += (qrem & below).count_ones();
                 qrem &= !below;
-                finish!(p);
+                // ---- end of line [line start, p) (the virtual newline after a trailing '\n' ends nothing)
+                lines += (p < n || fstart < n || nf > 0) as u64;
+                if nf + 1 == N {
+                    bounds[nf] = (fstart, p);
+                    let mut fs: [&'a [u8]; N] = [&[]; N];
+                    let mut ok = true;
+                    // positions come from the delimiter masks of `data`: always in range, s <= e
+                    if lq == 0 {
+                        for k in 0..N {
+                            fs[k] = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
+                        }
+                    } else {
+                        let mut qf = 0u32;
+                        for k in 0..N {
+                            let v = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
+                            if !v.is_empty() && v[0] == b'"' {
+                                let l = v.len();
+                                if l < 2 || v[l - 1] != b'"' {
+                                    ok = false;
+                                    break;
+                                }
+                                qf += 1;
+                                fs[k] = &v[1..l - 1];
+                            } else {
+                                fs[k] = v;
+                            }
+                        }
+                        ok &= qf * 2 == lq;
+                    }
+                    if ok {
+                        f(&fs);
+                    }
+                }
+                nf = 0;
+                lq = 0;
+                fstart = p + 1;
             }
         }
         lq += qrem.count_ones();
         blk += 64;
     }
     let _ = &tail;
-    if fstart < data.len() || (fstart == data.len() && nf > 0) {
-        finish!(data.len());
-    }
     lines
 }
 
