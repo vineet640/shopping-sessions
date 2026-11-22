@@ -736,11 +736,14 @@ struct Ctx<'a> {
     we: i64,
     cws: i64,
     tbits: u32,
+    pshift: u32,
 }
 
 #[inline]
-fn pbucket(r: u32) -> usize {
-    (r.wrapping_mul(0x9E37_79B1) >> (32 - PB_BITS)) as usize
+fn pbucket(r: u32, pshift: u32) -> usize {
+    // top bits of the slot index: slots are hash positions, so buckets are balanced, and the
+    // key's high bits are constant within a bucket (the radix sort skips those digits)
+    (r >> pshift) as usize
 }
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
@@ -761,7 +764,7 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 ($pp:expr) => {{
                     let (k, ing, tsr, price, cat, uk, us): (Key, i64, u64, u32, u16, Key, &[u8]) = $pp;
                     let root = cx.tab.insert(uk, us, arena, w, newids).1;
-                    let pb = pbucket(root);
+                    let pb = pbucket(root, cx.pshift);
                     let v = &mut pev[pb];
                     let r = ((w as u64) << 56) | ((pb as u64) << 40) | v.len() as u64;
                     v.push(PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
@@ -830,7 +833,7 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 let root = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).1;
                 let (b0, b1) = be16(f[0]);
                 let o = f[0].as_ptr() as usize - base.as_ptr() as usize;
-                ckb[pbucket(root)].push(PCk {
+                ckb[pbucket(root, cx.pshift)].push(PCk {
                     key: ((root as u64) << cx.tbits) | (ts - cx.cws) as u64,
                     b0,
                     b1,
@@ -891,47 +894,100 @@ struct Worker {
     ck_tmp: Vec<PCk>,
     since: Vec<u32>,
     sday: Vec<u16>,
+    hist: Vec<u32>,
 }
 
-/// LSD radix sort by the low `bits` bits of key(x), 11-bit digits; skips constant digits.
-fn radix_sort<T: Copy, F: Fn(&T) -> u64>(v: &mut Vec<T>, tmp: &mut Vec<T>, bits: u32, key: F) {
-    let n = v.len();
+/// Gathers the rows of `srcs` that pass `keep` into `out`, sorted by key (LSD radix, 12-bit
+/// digits, one histogram pass for all digits, constant digits skipped, the first scatter reads
+/// straight from the sources).
+#[allow(clippy::too_many_arguments)]
+fn radix_gather<T: Copy, P: Fn(&T) -> bool, K: Fn(&T) -> u64>(
+    srcs: &[&[T]],
+    keep: P,
+    out: &mut Vec<T>,
+    tmp: &mut Vec<T>,
+    hist: &mut Vec<u32>,
+    bits: u32,
+    key: K,
+) {
+    const D: u32 = 12;
+    const R: usize = 1 << D;
+    let nd = bits.div_ceil(D).max(1) as usize;
+    hist.clear();
+    hist.resize(nd * R, 0);
+    let mut n = 0usize;
+    for s in srcs {
+        for x in s.iter() {
+            if keep(x) {
+                let k = key(x);
+                for d in 0..nd {
+                    hist[d * R + ((k >> (D * d as u32)) as usize & (R - 1))] += 1;
+                }
+                n += 1;
+            }
+        }
+    }
+    out.clear();
     if n < 256 {
-        v.sort_unstable_by_key(|x| key(x));
+        for s in srcs {
+            out.extend(s.iter().filter(|x| keep(x)).copied());
+        }
+        out.sort_unstable_by_key(|x| key(x));
         return;
     }
-    const D: u32 = 11;
-    const R: usize = 1 << D;
+    out.reserve(n);
     tmp.clear();
     tmp.reserve(n);
-    unsafe { tmp.set_len(n) };
-    let mut cnt = vec![0usize; R];
-    let mut shift = 0;
-    while shift < bits {
-        cnt.iter_mut().for_each(|c| *c = 0);
-        for x in v.iter() {
-            cnt[((key(x) >> shift) as usize) & (R - 1)] += 1;
-        }
-        if cnt.iter().any(|&c| c == n) {
-            shift += D;
+    unsafe {
+        out.set_len(n);
+        tmp.set_len(n);
+    }
+    let mut first = true;
+    for d in 0..nd {
+        let h = &mut hist[d * R..(d + 1) * R];
+        if h.iter().any(|&c| c as usize == n) {
             continue;
         }
-        let mut sum = 0;
-        for c in cnt.iter_mut() {
+        let mut sum = 0u32;
+        for c in h.iter_mut() {
             let t = *c;
             *c = sum;
             sum += t;
         }
-        for x in v.iter() {
-            let d = ((key(x) >> shift) as usize) & (R - 1);
-            tmp[cnt[d]] = *x;
-            cnt[d] += 1;
+        let sh = D * d as u32;
+        if first {
+            for s in srcs {
+                for x in s.iter() {
+                    if keep(x) {
+                        let g = (key(x) >> sh) as usize & (R - 1);
+                        out[h[g] as usize] = *x;
+                        h[g] += 1;
+                    }
+                }
+            }
+            first = false;
+        } else {
+            for x in out.iter() {
+                let g = (key(x) >> sh) as usize & (R - 1);
+                tmp[h[g] as usize] = *x;
+                h[g] += 1;
+            }
+            std::mem::swap(out, tmp);
         }
-        std::mem::swap(v, tmp);
-        shift += D;
+    }
+    if first {
+        // every digit constant: all keys equal
+        let mut i = 0;
+        for s in srcs {
+            for x in s.iter() {
+                if keep(x) {
+                    out[i] = *x;
+                    i += 1;
+                }
+            }
+        }
     }
 }
-
 
 // ---------------------------------------------------------------- main
 
@@ -1108,6 +1164,7 @@ fn main() {
             we,
             cws,
             tbits,
+            pshift: (cap.trailing_zeros()).saturating_sub(PB_BITS),
         };
         // ---- A: links
         link_chunks.par_iter().for_each(|c| {
@@ -1289,6 +1346,7 @@ fn main() {
                 ck_tmp: vec![],
                 since: vec![0; ncamp],
                 sday: vec![],
+                hist: vec![],
             })
         })
         .collect();
@@ -1306,16 +1364,10 @@ fn main() {
             let wk = &mut *wk;
             let mut ev = std::mem::take(&mut wk.ev_buf);
             let mut ck = std::mem::take(&mut wk.ck_buf);
-            ev.clear();
-            ck.clear();
-            for t in &routed {
-                ev.extend(t[b].iter().filter(|e| !e.dead).copied());
-            }
-            radix_sort(&mut ev, &mut wk.ev_tmp, kbits, |e| e.key);
-            for t in &ckbs {
-                ck.extend_from_slice(&t[b]);
-            }
-            radix_sort(&mut ck, &mut wk.ck_tmp, kbits, |c| c.key);
+            let esrc: Vec<&[PEv]> = routed.iter().map(|t| &t[b][..]).collect();
+            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits, |e| e.key);
+            let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| &t[b][..]).collect();
+            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits, |c| c.key);
             // equal keys (same person, same ms): order by click_id bytes
             let cmp_id = |x: &PCk, y: &PCk| {
                 (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
