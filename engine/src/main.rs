@@ -381,8 +381,9 @@ fn digits8(x: u64) -> bool {
 /// 8 digits -> four 2-digit values in 16-bit lanes (lane 0 = first two characters)
 #[inline(always)]
 fn pairs8(x: u64) -> u64 {
-    let v = x - 0x3030_3030_3030_3030;
-    (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF
+    // wrapping: callers may compute this before checking digits8 (result discarded then)
+    let v = x.wrapping_sub(0x3030_3030_3030_3030);
+    (v.wrapping_mul(10).wrapping_add(v >> 8)) & 0x00FF_00FF_00FF_00FF
 }
 
 /// ingest_ts: rules.md guarantees it is always a valid F1 ("YYYY-MM-DDTHH:MM:SSZ"), so the
@@ -1056,10 +1057,14 @@ impl<T: Copy> Buckets<T> {
     /// append to bucket b, returning the row's index within the bucket
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) -> usize {
-        let l = self.lens[b];
+        // b < number of buckets always (bucket ids come from shifts of hashes / slot indexes)
+        debug_assert!(b < self.lens.len());
+        let l = unsafe { *self.lens.get_unchecked(b) };
         if (l as usize) < self.cap {
-            unsafe { self.base.add(b * self.cap + l as usize).write(x) };
-            self.lens[b] = l + 1;
+            unsafe {
+                self.base.add(b * self.cap + l as usize).write(x);
+                *self.lens.get_unchecked_mut(b) = l + 1;
+            }
             l as usize
         } else {
             self.push_slow(b, x)
@@ -1082,7 +1087,8 @@ impl<T: Copy> Buckets<T> {
     }
     #[inline(always)]
     fn at_mut(&mut self, b: usize, i: usize) -> &mut T {
-        if self.lens[b] == u32::MAX {
+        debug_assert!(b < self.lens.len());
+        if unsafe { *self.lens.get_unchecked(b) } == u32::MAX {
             &mut self.spill[b][i]
         } else {
             unsafe { &mut *self.base.add(b * self.cap + i) }
