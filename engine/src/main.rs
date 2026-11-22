@@ -190,24 +190,44 @@ fn mix(k: Key) -> u64 {
 }
 
 /// Small read-only exact-key map (products, campaigns).
+/// Read-only exact-key map (products, campaigns): one entry array (key + value in one line),
+/// 2 MB-aligned and THP-advised so random lookups stay TLB-friendly. Leaked: lives for the run.
+#[derive(Clone, Copy, Default)]
+struct SmEntry {
+    k: Key,
+    v: u16,
+}
 struct SmallMap {
     mask: usize,
-    keys: Vec<Key>,
-    vals: Vec<u16>,
+    e: &'static mut [SmEntry],
+}
+fn huge_slice<T: Copy + Default>(n: usize) -> &'static mut [T] {
+    const HP: usize = 2 << 20;
+    let bytes = (n * std::mem::size_of::<T>()).max(1).div_ceil(HP) * HP;
+    let layout = std::alloc::Layout::from_size_align(bytes, HP).unwrap();
+    let p = unsafe { std::alloc::alloc(layout) } as *mut T;
+    assert!(!p.is_null(), "alloc");
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::madvise(p as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+    }
+    for i in 0..n {
+        unsafe { p.add(i).write(T::default()) };
+    }
+    unsafe { std::slice::from_raw_parts_mut(p, n) }
 }
 impl SmallMap {
     fn new(items: &[(Key, u16)]) -> Self {
         let cap = (items.len() * 2).next_power_of_two().max(16);
-        let mut m = SmallMap { mask: cap - 1, keys: vec![Key::default(); cap], vals: vec![0; cap] };
+        let m = SmallMap { mask: cap - 1, e: huge_slice::<SmEntry>(cap) };
         for &(k, v) in items {
             let mut i = mix(k) as usize & m.mask;
             loop {
-                if m.keys[i].hi == 0 {
-                    m.keys[i] = k;
-                    m.vals[i] = v;
+                if m.e[i].k.hi == 0 {
+                    m.e[i] = SmEntry { k, v };
                     break;
                 }
-                if m.keys[i] == k {
+                if m.e[i].k == k {
                     break; // first wins
                 }
                 i = (i + 1) & m.mask;
@@ -218,17 +238,17 @@ impl SmallMap {
     #[inline(always)]
     fn prefetch(&self, k: Key) {
         let i = mix(k) as usize & self.mask;
-        prefetch_ptr(self.keys.as_ptr().wrapping_add(i) as *const i8);
+        prefetch_ptr(self.e.as_ptr().wrapping_add(i) as *const i8);
     }
     #[inline]
     fn get(&self, k: Key) -> Option<u16> {
         let mut i = mix(k) as usize & self.mask;
         loop {
-            let s = self.keys[i];
-            if s == k {
-                return Some(self.vals[i]);
+            let s = &self.e[i];
+            if s.k == k {
+                return Some(s.v);
             }
-            if s.hi == 0 {
+            if s.k.hi == 0 {
                 return None;
             }
             i = (i + 1) & self.mask;
