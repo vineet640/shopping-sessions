@@ -11,12 +11,10 @@ run() {
   t0=$(ns); env DATA_DIR=/scratch/g OUTPUT_DIR=/scratch/o "$@" /app/ss 2>/scratch/log; t1=$(ns)
   echo "$* wall=$(( (t1-t0)/1000000 ))ms: $(sed -E 's/\] ([A-Za-z0-9-]+).*/ \1/; s/\[ *//; s/s / /' /scratch/log | tr '\n' ' ')"
 }
-run X=1
-run X=2
+run X=1 SS_STATS=1
+run X=2 SS_STATS=1
 run X=3
+run SS_POPMODE=map
 run SS_POPMODE=chunk
-run SS_POPMODE=none
-run NCPU=16
-run NCPU=4
 echo "END (exit 1 on purpose)"
 exit 1
