@@ -35,6 +35,7 @@ const PF: usize = 8; // rows in flight between id-slot prefetch and insert (hide
 
 static STATS: AtomicBool = AtomicBool::new(false);
 static SI: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static SP: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 macro_rules! log {
     ($($a:tt)*) => {{
@@ -393,9 +394,11 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     }
     if n == 20 || n == 25 {
         if f[4] == b'-' {
-            let w0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
-            let w1 = u64::from_le_bytes(f[8..16].try_into().unwrap());
-            let w2 = u32::from_le_bytes(f[16..20].try_into().unwrap()) as u64;
+            // n >= 20: fixed-offset unaligned loads, no bounds checks
+            let p = f.as_ptr();
+            let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            let w1 = unsafe { (p.add(8) as *const u64).read_unaligned() }.to_le();
+            let w2 = unsafe { (p.add(16) as *const u32).read_unaligned() }.to_le() as u64;
             if (w0 >> 56) as u8 != b'-' || (w1 >> 16) as u8 != b'T' || (w1 >> 40) as u8 != b':' || w2 as u8 != b':' {
                 return None;
             }
@@ -418,7 +421,8 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
             }
             let yi = y - dc.ybase;
             let day = if (0..DC_YEARS).contains(&yi) && (1..=12).contains(&mo) && (1..=31).contains(&d) && !dc.days.is_empty() {
-                let v = dc.days[(yi * 372 + (mo - 1) * 31 + (d - 1)) as usize];
+                // index < DC_YEARS * 372 = days.len() by the range checks above
+                let v = unsafe { *dc.days.get_unchecked((yi * 372 + (mo - 1) * 31 + (d - 1)) as usize) };
                 if v == i32::MIN {
                     return None;
                 }
@@ -427,7 +431,7 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
                 parse_date(f)?
             };
             let off = if n == 20 {
-                if f[19] != b'Z' {
+                if (w2 >> 24) as u8 != b'Z' {
                     return None;
                 }
                 0
@@ -465,9 +469,13 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
         // two overlapping 8-digit SWAR loads cover every digit (typical 13-digit epoch ms)
         const P10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
         let hi = p8(&r[..8])?;
-        let lo = p8(&r[m - 8..])?;
-        let k = m - 8;
-        hi * P10[k] + lo % P10[k]
+        // last 8 bytes, with the (16 - m) digits already counted in `hi` forced to '0' (no division)
+        let x = u64::from_le_bytes(r[m - 8..].try_into().unwrap());
+        let ov = 16 - m; // 0..=7 overlapping leading bytes (low bytes of the LE word)
+        let low_mask = if ov == 0 { 0 } else { u64::MAX >> (64 - 8 * ov) };
+        let x = (x & !low_mask) | (0x3030_3030_3030_3030 & low_mask);
+        let lo = p8(&x.to_le_bytes())?;
+        hi * P10[m - 8] + lo
     } else {
         let mut v: u64 = 0;
         let mut j = 0;
@@ -945,7 +953,6 @@ struct PCk {
     camp: u16,
 }
 
-#[inline]
 /// first 8 bytes, big-endian, zero padded (lexicographic order of the prefix)
 #[inline]
 fn be8(s: &[u8]) -> u64 {
@@ -1029,6 +1036,14 @@ impl<T: Copy> Buckets<T> {
         v.push(x);
         v.len() - 1
     }
+    #[inline(always)]
+    fn at_mut(&mut self, b: usize, i: usize) -> &mut T {
+        if self.lens[b] == u32::MAX {
+            &mut self.spill[b][i]
+        } else {
+            unsafe { &mut *self.base.add(b * self.cap + i) }
+        }
+    }
     #[inline]
     fn slice(&self, b: usize) -> &[T] {
         let l = self.lens[b];
@@ -1104,6 +1119,22 @@ fn pbucket(r: u32, pshift: u32) -> usize {
 }
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
+    if STATS.load(Ordering::Relaxed) {
+        let t = Instant::now();
+        parse_chunk_inner(cx, c, w, out);
+        let k = match c.kind {
+            Kind::Ev => 0,
+            Kind::Ck => 1,
+            Kind::Ln => 2,
+        };
+        SP[k].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    } else {
+        parse_chunk_inner(cx, c, w, out);
+    }
+}
+
+#[inline(always)]
+fn parse_chunk_inner(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let base = cx.files.b[c.fi].get();
     #[cfg(target_os = "linux")]
     if popmode() == PopMode::Chunk {
@@ -1123,18 +1154,20 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut ring: [Option<(Key, i64, u64, u32, Key, usize, Key, usize, &[u8])>; PF] = [None; PF];
+            // ring of rows waiting for their id-slot prefetch: (user key, slot, ts offset, price,
+            // category, dedup bucket, dedup row, user id bytes). The dedup record is written at
+            // once with r = NONE and patched when the row's person bucket position is known.
+            type Pend<'x> = (Key, u32, u32, u32, u16, u16, u32, &'x [u8]);
+            let mut ring: [Pend; PF] = [(Key::default(), 0, 0, 0, 0, 0, 0, &[]); PF];
             let mut rpos = 0usize;
             let tbits = cx.tbits;
             macro_rules! finish_ev {
                 ($pp:expr) => {{
-                    let (k, ing, tsr, price, pk, pi, uk, ui, us): (Key, i64, u64, u32, Key, usize, Key, usize, &[u8]) = $pp;
-                    let cat = cx.products.get_at(pk, pi).unwrap_or(cx.unknown_cat);
-                    let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
+                    let (uk, ui, tsr, price, cat, db, ei, us): Pend = $pp;
+                    let root = cx.tab.insert_at(uk, ui as usize, us, arena, w, newids).1;
                     let pb = pbucket(root, cx.pshift);
-                    let i = pev.push(pb, PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
-                    let r = ((w as u64) << 56) | ((pb as u64) << 40) | i as u64;
-                    evb.push((mix(k) >> (64 - DB_BITS)) as usize, Ev { klo: k.lo, khi: k.hi, ing, r });
+                    let i = pev.push(pb, PEv { key: ((root as u64) << tbits) | tsr as u64, price, cat, dead: false });
+                    evb.at_mut(db as usize, ei as usize).r = ((w as u64) << 56) | ((pb as u64) << 40) | i as u64;
                 }};
             }
             nlines[0] += for_lines::<7, _>(data, |f| {
@@ -1166,26 +1199,28 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 if ok && ing - ts > LATE {
                     ok = false;
                 }
+                let db = (mix(k) >> (64 - DB_BITS)) as usize;
+                let ei = evb.push(db, Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 if ok {
-                    // software pipeline: prefetch this row's id slot, finish the previous row's insert
+                    // software pipeline: prefetch this row's id slot, finish the row PF back
                     let uk = key_at(f[1], avail(f[1]));
                     let ui = cx.tab.prefetch(uk);
-                    let pk = key_at(f[5], avail(f[5]));
-                    let pi = cx.products.prefetch(pk);
-                    let slot = rpos % PF;
-                    rpos += 1;
-                    if let Some(pp) = ring[slot].take() {
-                        finish_ev!(pp);
+                    // category only matters for purchases (top_category); views/carts skip it
+                    let cat = if price > 0 {
+                        cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat)
+                    } else {
+                        0
+                    };
+                    let slot = rpos & (PF - 1);
+                    if rpos >= PF {
+                        finish_ev!(ring[slot]);
                     }
-                    ring[slot] = Some((k, ing, (ts - cx.cws) as u64, price, pk, pi, uk, ui, f[1]));
-                } else {
-                    evb.push((mix(k) >> (64 - DB_BITS)) as usize, Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
+                    ring[slot] = (uk, ui as u32, (ts - cx.cws) as u32, price, cat, db as u16, ei as u32, f[1]);
+                    rpos += 1;
                 }
             });
-            for i in 0..PF {
-                if let Some(pp) = ring[(rpos + i) % PF].take() {
-                    finish_ev!(pp);
-                }
+            for q in rpos.saturating_sub(PF)..rpos {
+                finish_ev!(ring[q & (PF - 1)]);
             }
         }
         Kind::Ck => {
@@ -1524,6 +1559,11 @@ fn main() {
     all.push(data.join("products.csv"));
     all.push(data.join("campaigns.csv"));
     let files = Files { b: all.par_iter().map(|p| open(p)).collect() };
+    if std::env::var_os("SS_PRETOUCH").is_some() {
+        // profiling aid: fault in every input page up front (macOS has no MAP_POPULATE)
+        let s: u64 = files.b.par_iter().map(|b| b.get().iter().step_by(4096).map(|&x| x as u64).sum::<u64>()).sum();
+        log!("pretouched ({s})");
+    }
     let total: usize = files.b.iter().map(|b| b.get().len()).sum();
     log!("{} csv files, {:.1} MB, {} threads", all.len(), total as f64 / 1e6, nthreads);
 
@@ -1736,6 +1776,10 @@ fn main() {
     let nl: [u64; 3] = outs.iter().fold([0; 3], |a, o| [a[0] + o.nlines[0], a[1] + o.nlines[1], a[2] + o.nlines[2]]);
     let nids: usize = outs.iter().map(|o| o.newids).sum();
     log!("parsed: {} event lines, {} click lines, {} link lines; {} ids (cap {})", nl[0], nl[1], nl[2], nids, cap);
+    if STATS.load(Ordering::Relaxed) {
+        let g = |k: usize| SP[k].load(Ordering::Relaxed) as f64 / 1e9;
+        log!("stats parse thread-s: events {:.3} clicks {:.3} links {:.3}", g(0), g(1), g(2));
+    }
     if std::env::var_os("SS_STOP_AFTER_PARSE").is_some() {
         std::process::exit(0); // profiling aid
     }
@@ -1958,14 +2002,32 @@ fn main() {
             }
             let t2 = if st { Some(Instant::now()) } else { None };
             let mut rows: Vec<UdRow> = Vec::new();
-            let mut i = 0usize;
-            let mut cj = 0usize;
-            while i < ev.len() {
-                let p = ev[i].key >> tbits;
-                let mut iend = i + 1;
-                while iend < ev.len() && (ev[iend].key >> tbits) == p {
-                    iend += 1;
+            // persons of this bucket, then their names resolved in tight independent loops
+            // (random reads into name1 / the id table overlap instead of serializing per person)
+            let mut pers: Vec<(u32, u32, u32)> = Vec::new();
+            {
+                let mut i = 0usize;
+                while i < ev.len() {
+                    let p = ev[i].key >> tbits;
+                    let mut iend = i + 1;
+                    while iend < ev.len() && (ev[iend].key >> tbits) == p {
+                        iend += 1;
+                    }
+                    pers.push((i as u32, iend as u32, p as u32));
+                    i = iend;
                 }
+            }
+            let nslots: Vec<u32> = pers
+                .iter()
+                .map(|&(_, _, p)| {
+                    let n1 = name_r[p as usize].load(Ordering::Relaxed);
+                    if n1 == 0 { p } else { n1 - 1 }
+                })
+                .collect();
+            let names: Vec<SPtr> = nslots.iter().map(|&ns| tab_r.sptr(ns)).collect();
+            let mut cj = 0usize;
+            for (pi, &(i, iend, p)) in pers.iter().enumerate() {
+                let (i, iend, p) = (i as usize, iend as usize, p as u64);
                 while cj < ck.len() && (ck[cj].key >> tbits) < p {
                     cj += 1;
                 }
@@ -1973,8 +2035,6 @@ fn main() {
                 while cend < ck.len() && (ck[cend].key >> tbits) == p {
                     cend += 1;
                 }
-                let n1 = name_r[p as usize].load(Ordering::Relaxed);
-                let nslot = if n1 == 0 { p as u32 } else { n1 - 1 };
                 person(
                     &ev[i..iend],
                     &ck[cj..cend],
@@ -1983,12 +2043,11 @@ fn main() {
                     ws_day,
                     ndays,
                     ncamp,
-                    tab_r.sptr(nslot),
+                    names[pi],
                     cat_rank_r,
                     wk,
                     &mut rows,
                 );
-                i = iend;
                 cj = cend;
             }
             let t3 = if st { Some(Instant::now()) } else { None };
@@ -2210,6 +2269,14 @@ fn person(
 #[inline]
 fn span_add(assisted: &mut [u64], sday: &[u16], c: usize, ndays: usize, a: u32, b: u32) {
     let (mut k, b) = (a as usize, b as usize);
+    if b - k <= 16 {
+        // short spans (the common case): linear
+        while k < b {
+            assisted[c * ndays + sday[k] as usize] += 1;
+            k += 1;
+        }
+        return;
+    }
     while k < b {
         let d = sday[k];
         let e = k + sday[k..b].partition_point(|&x| x <= d);
