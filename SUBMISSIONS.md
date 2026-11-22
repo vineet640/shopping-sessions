@@ -1,4 +1,4 @@
-# Submissions (2/hour/team, >=31 min apart)
+# Submissions (5/hour/team since 21:12 Sat, >=12 min apart)
 
 | time (CST) | SHA | change | result |
 | --- | --- | --- | --- |
