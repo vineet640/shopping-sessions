@@ -904,6 +904,24 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
             }
         }
         Kind::Ck => {
+            // same software pipeline as events: prefetch the user's id slot, insert one row later
+            let mut pending: Option<(Key, &[u8], u64, u16, &[u8])> = None;
+            macro_rules! finish_ck {
+                ($pp:expr) => {{
+                    let (uk, us, tsr, camp, id): (Key, &[u8], u64, u16, &[u8]) = $pp;
+                    let root = cx.tab.insert(uk, us, arena, w, newids).1;
+                    let (b0, b1) = be16(id);
+                    let o = id.as_ptr() as usize - base.as_ptr() as usize;
+                    ckb[pbucket(root, cx.pshift)].push(PCk {
+                        key: ((root as u64) << cx.tbits) | tsr,
+                        b0,
+                        b1,
+                        len: id.len() as u32,
+                        camp,
+                        id: SPtr { off: ((c.fi as u64) << 40) | o as u64, len: id.len() as u32 },
+                    });
+                }};
+            }
             nlines[1] += for_lines::<4, _>(data, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -916,18 +934,16 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     Some(c) => c,
                     None => return,
                 };
-                let root = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).1;
-                let (b0, b1) = be16(f[0]);
-                let o = f[0].as_ptr() as usize - base.as_ptr() as usize;
-                ckb[pbucket(root, cx.pshift)].push(PCk {
-                    key: ((root as u64) << cx.tbits) | (ts - cx.cws) as u64,
-                    b0,
-                    b1,
-                    len: f[0].len() as u32,
-                    camp,
-                    id: SPtr { off: ((c.fi as u64) << 40) | o as u64, len: f[0].len() as u32 },
-                });
+                let uk = key_at(f[1], avail(f[1]));
+                cx.tab.prefetch(uk);
+                if let Some(pp) = pending.take() {
+                    finish_ck!(pp);
+                }
+                pending = Some((uk, f[1], (ts - cx.cws) as u64, camp, f[0]));
             });
+            if let Some(pp) = pending.take() {
+                finish_ck!(pp);
+            }
         }
         Kind::Ln => {
             nlines[2] += for_lines::<2, _>(data, |f| {
