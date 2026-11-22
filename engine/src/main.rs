@@ -1514,6 +1514,9 @@ fn main() {
     let nl: [u64; 3] = outs.iter().fold([0; 3], |a, o| [a[0] + o.nlines[0], a[1] + o.nlines[1], a[2] + o.nlines[2]]);
     let nids: usize = outs.iter().map(|o| o.newids).sum();
     log!("parsed: {} event lines, {} click lines, {} link lines; {} ids (cap {})", nl[0], nl[1], nl[2], nids, cap);
+    if std::env::var_os("SS_STOP_AFTER_PARSE").is_some() {
+        std::process::exit(0); // profiling aid
+    }
     let arenas = Arenas { a: outs.iter_mut().map(|o| std::mem::take(&mut o.arena)).collect() };
 
     // ---- C: dedup. One pass per event-id bucket with an L2-sized table; when two copies of an
@@ -2300,5 +2303,35 @@ mod tok_fuzz {
             assert_eq!(collect::<4>(&d, true), collect::<4>(&d, false), "N=4 round {round}");
             assert_eq!(collect::<7>(&d, true), collect::<7>(&d, false), "N=7 round {round}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ts_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_parse_ts() {
+        let text = std::fs::read_to_string("../out/ts_sample.txt").unwrap();
+        let v: Vec<&[u8]> = text.lines().map(|l| l.as_bytes()).collect();
+        let ws = parse_ts(b"2027-12-01T00:00:00Z", &mut DateCache::default()).unwrap();
+        let mut dc = DateCache::new(ws);
+        let t = std::time::Instant::now();
+        let mut acc = 0i64;
+        for _ in 0..5 {
+            for s in &v {
+                acc = acc.wrapping_add(parse_ts(std::hint::black_box(s), &mut dc).unwrap_or(1));
+            }
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (5 * v.len()) as f64;
+        eprintln!("parse_ts: {ns:.1} ns/ts over {} samples (acc {acc})", v.len());
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            for s in &v {
+                acc = acc.wrapping_add(key(std::hint::black_box(s)).lo as i64);
+            }
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (5 * v.len()) as f64;
+        eprintln!("key(): {ns:.1} ns (acc {acc})");
     }
 }
