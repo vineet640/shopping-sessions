@@ -946,6 +946,19 @@ struct PCk {
 }
 
 #[inline]
+/// first 8 bytes, big-endian, zero padded (lexicographic order of the prefix)
+#[inline]
+fn be8(s: &[u8]) -> u64 {
+    if s.len() >= 8 {
+        u64::from_be_bytes(s[..8].try_into().unwrap())
+    } else {
+        let mut b = [0u8; 8];
+        b[..s.len()].copy_from_slice(s);
+        u64::from_be_bytes(b)
+    }
+}
+
+#[allow(dead_code)]
 fn be16(s: &[u8]) -> (u64, u64) {
     let mut b = [0u8; 16];
     let n = s.len().min(16);
@@ -1183,7 +1196,7 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 ($pp:expr) => {{
                     let (uk, ui, us, tsr, camp, id): (Key, usize, &[u8], u64, u16, &[u8]) = $pp;
                     let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
-                    let (b0, _) = be16(id);
+                    let b0 = be8(id);
                     let o = id.as_ptr() as usize - base.as_ptr() as usize;
                     ckb.push(pbucket(root, cx.pshift), PCk {
                         key: ((root as u64) << cx.tbits) | tsr,
@@ -1295,6 +1308,7 @@ struct Worker {
     sday: Vec<u16>,
     hist: Vec<u32>,
     udw: Option<PqWriter>,
+    udrows: Vec<UdRow>,
 }
 
 /// Vec with the given capacity whose buffer is advised for transparent huge pages (Linux).
@@ -1833,6 +1847,7 @@ fn main() {
                 sday: vec![],
                 hist: vec![],
                 udw: None,
+                udrows: Vec::new(),
             })
         })
         .collect();
@@ -1979,9 +1994,13 @@ fn main() {
             let t3 = if st { Some(Instant::now()) } else { None };
             wk.ev_buf = ev;
             wk.ck_buf = ck;
-            if !rows.is_empty() {
+            // batch rows per worker: fewer, larger Arrow batches
+            let nrows = rows.len();
+            wk.udrows.extend(rows.drain(..));
+            if wk.udrows.len() >= 1 << 16 {
                 let pw = wk.udw.get_or_insert_with(|| ud_writer(&ud_dir, w));
-                ud_write(pw, &rows, arenas_r, catnames_r);
+                ud_write(pw, &wk.udrows, arenas_r, catnames_r);
+                wk.udrows.clear();
             }
             if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
                 let t4 = Instant::now();
@@ -1989,7 +2008,7 @@ fn main() {
                     SI[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
                 }
             }
-            rows.len()
+            nrows
         })
         .collect();
     if STATS.load(Ordering::Relaxed) {
@@ -2001,11 +2020,24 @@ fn main() {
     let nud: usize = ud_parts.iter().sum();
     log!("sessions done: {} user_daily rows", nud);
     // close the per-worker user_daily files (in parallel); an empty table still gets one file
-    let mut writers: Vec<PqWriter> = workers.iter().filter_map(|w| w.lock().unwrap().udw.take()).collect();
-    if writers.is_empty() {
-        writers.push(ud_writer(&ud_dir, 0));
+    // flush each worker's remaining rows and close its file (in parallel)
+    let mut pend: Vec<(usize, Option<PqWriter>, Vec<UdRow>)> = workers
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let mut g = w.lock().unwrap();
+            (i, g.udw.take(), std::mem::take(&mut g.udrows))
+        })
+        .filter(|(_, w, r)| w.is_some() || !r.is_empty())
+        .collect();
+    if pend.is_empty() {
+        pend.push((0, None, Vec::new()));
     }
-    writers.into_par_iter().for_each(|w| {
+    pend.into_par_iter().for_each(|(i, w, rows)| {
+        let mut w = w.unwrap_or_else(|| ud_writer(&ud_dir, i));
+        if !rows.is_empty() {
+            ud_write(&mut w, &rows, arenas_r, catnames_r);
+        }
         w.close().unwrap();
     });
 
