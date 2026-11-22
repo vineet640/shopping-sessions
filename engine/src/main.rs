@@ -56,6 +56,28 @@ impl Bytes {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PopMode {
+    Map,   // MAP_POPULATE whole files at open (per-file, serial within a file)
+    Chunk, // MADV_POPULATE_READ per parse chunk (parallel)
+    None,  // plain page faults
+}
+fn popmode() -> PopMode {
+    static M: std::sync::OnceLock<PopMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("SS_POPMODE").as_deref() {
+        Ok("chunk") => PopMode::Chunk,
+        Ok("none") => PopMode::None,
+        Ok("map") => PopMode::Map,
+        _ => {
+            if std::env::var_os("SS_NOPOPULATE").is_some() {
+                PopMode::None
+            } else {
+                PopMode::Map
+            }
+        }
+    })
+}
+
 fn open(path: &Path) -> Bytes {
     let f = fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let len = f.metadata().unwrap().len();
@@ -64,7 +86,7 @@ fn open(path: &Path) -> Bytes {
     }
     let mut o = memmap2::MmapOptions::new();
     #[cfg(target_os = "linux")]
-    if std::env::var_os("SS_NOPOPULATE").is_none() {
+    if popmode() == PopMode::Map {
         o.populate();
     }
     let m = unsafe { o.map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
@@ -802,6 +824,14 @@ fn pbucket(r: u32, pshift: u32) -> usize {
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let base = cx.files.b[c.fi].get();
+    #[cfg(target_os = "linux")]
+    if popmode() == PopMode::Chunk {
+        if let Bytes::Map(m) = &cx.files.b[c.fi] {
+            let a = c.s & !4095;
+            let e = (c.e + 4096).min(m.len());
+            let _ = m.advise_range(memmap2::Advice::PopulateRead, a, e - a);
+        }
+    }
     let (rs, re) = chunk_region(base, c);
     if re <= rs {
         return;
