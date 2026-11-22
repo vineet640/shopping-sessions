@@ -9,3 +9,4 @@ reference/
 .git
 .venv
 engine/target/
+tools/traingen/target/

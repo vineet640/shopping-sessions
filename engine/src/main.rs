@@ -532,16 +532,17 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
             if nf + 1 == N {
                 bounds[nf] = (fstart, end);
                 let mut fs: [&'a [u8]; N] = [&[]; N];
+                // positions come from the delimiter masks of `data`: always in range, s <= e
                 if lq == 0 {
                     for k in 0..N {
-                        fs[k] = &data[bounds[k].0..bounds[k].1];
+                        fs[k] = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
                     }
                     f(&fs);
                 } else {
                     let mut ok = true;
                     let mut qf = 0u32;
                     for k in 0..N {
-                        let v = &data[bounds[k].0..bounds[k].1];
+                        let v = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
                         if !v.is_empty() && v[0] == b'"' {
                             let l = v.len();
                             if l < 2 || v[l - 1] != b'"' {
@@ -583,7 +584,7 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
             let p = blk + i as usize;
             if (nlm >> i) & 1 == 0 {
                 if nf < N {
-                    bounds[nf] = (fstart, p);
+                    unsafe { *bounds.get_unchecked_mut(nf) = (fstart, p) };
                 }
                 nf += 1;
                 fstart = p + 1;
@@ -1311,8 +1312,11 @@ fn radix_gather<T: Copy, P: Fn(&T) -> bool, K: Fn(&T) -> u64>(
     bits: u32,
     key: K,
 ) {
-    const D: u32 = 12;
-    const R: usize = 1 << D;
+    // one pass when the key has <= 16 bits, else 12-bit digits
+    let dd: u32 = if bits <= 16 { bits.max(1) } else { 12 };
+    let rr: usize = 1 << dd;
+    #[allow(non_snake_case)]
+    let (D, R) = (dd, rr);
     let nd = bits.div_ceil(D).max(1) as usize;
     hist.clear();
     hist.resize(nd * R, 0);
@@ -1808,7 +1812,9 @@ fn main() {
         })
         .collect();
     let tmask = (1u64 << tbits) - 1;
-    let kbits = tbits + (64 - (cap as u64).leading_zeros());
+    let _kbits = tbits + (64 - (cap as u64).leading_zeros());
+    let pshift_s = cap.trailing_zeros().saturating_sub(PB_BITS);
+    let pmask: u64 = (1u64 << pshift_s) - 1;
     let files_r = &files;
     let tab_r = &tab;
     let name_r = &name1;
@@ -1840,7 +1846,8 @@ fn main() {
             let t0 = if st { Some(Instant::now()) } else { None };
             // radix by person only (few varying bits), then sort each person's (small) run by time
             let esrc: Vec<&[PEv]> = routed.iter().map(|t| t.slice(b)).collect();
-            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits - tbits, |e| e.key >> tbits);
+            // within a bucket only the low `pshift` bits of the person root vary
+            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, pshift_s, |e| (e.key >> tbits) & pmask);
             let mut q = 0;
             while q < ev.len() {
                 let p = ev[q].key >> tbits;
@@ -1863,7 +1870,7 @@ fn main() {
             }
             let t1 = if st { Some(Instant::now()) } else { None };
             let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| t.slice(b)).collect();
-            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits - tbits, |c| c.key >> tbits);
+            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, pshift_s, |c| (c.key >> tbits) & pmask);
             // per person: by time, ties (same ms) by click_id bytes
             let cmp = |x: &PCk, y: &PCk| {
                 x.key.cmp(&y.key).then_with(|| {
@@ -2575,5 +2582,32 @@ mod ts_bench {
         }
         let ns = t.elapsed().as_nanos() as f64 / (5 * v.len()) as f64;
         eprintln!("key(): {ns:.1} ns (acc {acc})");
+    }
+}
+
+#[cfg(test)]
+mod tok_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_for_lines() {
+        let path = std::env::var("TOK_FILE").unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let body = &data[data.iter().position(|&c| c == b'\n').unwrap() + 1..data.len() - 1];
+        let mut lines = 0u64;
+        let mut acc = 0usize;
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            lines += for_lines::<7, _>(body, |f| {
+                acc = acc.wrapping_add(f[0].len() + f[6].len());
+            });
+        }
+        let el = t.elapsed();
+        eprintln!(
+            "for_lines: {:.1} ns/line, {:.2} GB/s ({} lines, acc {acc})",
+            el.as_nanos() as f64 / lines as f64,
+            (5 * body.len()) as f64 / el.as_secs_f64() / 1e9,
+            lines / 5
+        );
     }
 }
