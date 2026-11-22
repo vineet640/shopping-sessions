@@ -553,9 +553,6 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
         while s != 0 {
             let i = s.trailing_zeros();
             s &= s - 1;
-            let below = (1u64 << i) - 1;
-            lq += (qrem & below).count_ones();
-            qrem &= !below;
             let p = blk + i as usize;
             if (nlm >> i) & 1 == 0 {
                 if nf < N {
@@ -564,6 +561,10 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
                 nf += 1;
                 fstart = p + 1;
             } else {
+                // quotes of this line that sit in this block (earlier blocks already counted)
+                let below = (1u64 << i) - 1;
+                lq += (qrem & below).count_ones();
+                qrem &= !below;
                 finish!(p);
             }
         }
