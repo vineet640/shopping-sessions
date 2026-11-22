@@ -1620,28 +1620,71 @@ fn main() {
             let wk = &mut *wk;
             let mut ev = std::mem::take(&mut wk.ev_buf);
             let mut ck = std::mem::take(&mut wk.ck_buf);
+            // radix by person only (few varying bits), then sort each person's (small) run by time
             let esrc: Vec<&[PEv]> = routed.iter().map(|t| &t[b][..]).collect();
-            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits, |e| e.key);
+            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits - tbits, |e| e.key >> tbits);
+            let mut q = 0;
+            while q < ev.len() {
+                let p = ev[q].key >> tbits;
+                let mut r = q + 1;
+                while r < ev.len() && (ev[r].key >> tbits) == p {
+                    r += 1;
+                }
+                if r - q > 2048 {
+                    // whale person: radix on the time bits
+                    let run: Vec<PEv> = ev[q..r].to_vec();
+                    let mut out = Vec::new();
+                    let mut tmp = Vec::new();
+                    let mut h = Vec::new();
+                    radix_gather(&[&run[..]], |_| true, &mut out, &mut tmp, &mut h, tbits, |e| e.key & tmask);
+                    ev[q..r].copy_from_slice(&out);
+                } else if r - q > 1 {
+                    ev[q..r].sort_unstable_by_key(|e| e.key);
+                }
+                q = r;
+            }
             let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| &t[b][..]).collect();
-            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits, |c| c.key);
-            // equal keys (same person, same ms): order by click_id bytes
-            let cmp_id = |x: &PCk, y: &PCk| {
-                (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
-                    if x.len <= 16 && y.len <= 16 {
-                        x.len.cmp(&y.len)
-                    } else {
-                        files_r.s(x.id).cmp(files_r.s(y.id))
-                    }
+            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits - tbits, |c| c.key >> tbits);
+            // per person: by time, ties (same ms) by click_id bytes
+            let cmp = |x: &PCk, y: &PCk| {
+                x.key.cmp(&y.key).then_with(|| {
+                    (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
+                        if x.len <= 16 && y.len <= 16 {
+                            x.len.cmp(&y.len)
+                        } else {
+                            files_r.s(x.id).cmp(files_r.s(y.id))
+                        }
+                    })
                 })
             };
             let mut q = 0;
             while q < ck.len() {
+                let p = ck[q].key >> tbits;
                 let mut r = q + 1;
-                while r < ck.len() && ck[r].key == ck[q].key {
+                while r < ck.len() && (ck[r].key >> tbits) == p {
                     r += 1;
                 }
-                if r - q > 1 {
-                    ck[q..r].sort_unstable_by(cmp_id);
+                if r - q > 2048 {
+                    // big run: radix on time, then fix ties (same ms) by click_id
+                    let run: Vec<PCk> = ck[q..r].to_vec();
+                    let mut out = Vec::new();
+                    let mut tmp = Vec::new();
+                    let mut h = Vec::new();
+                    radix_gather(&[&run[..]], |_| true, &mut out, &mut tmp, &mut h, tbits, |c| c.key & tmask);
+                    let mut a = 0;
+                    while a < out.len() {
+                        let mut z = a + 1;
+                        while z < out.len() && out[z].key == out[a].key {
+                            z += 1;
+                        }
+                        if z - a > 1 {
+                            out[a..z].sort_unstable_by(cmp);
+                        }
+                        a = z;
+                    }
+                    ck[q..r].copy_from_slice(&out);
+                } else if r - q > 1 {
+                    ck[q..r].sort_unstable_by(cmp);
                 }
                 q = r;
             }
