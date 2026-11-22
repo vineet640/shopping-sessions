@@ -1679,7 +1679,10 @@ fn main() {
             unsafe { (*pptr.0[t][pb].add(i)).dead = true };
         }
     };
-    let dd_scratch: Vec<Mutex<Vec<u64>>> = (0..nworkers + 1).map(|_| Mutex::new(Vec::new())).collect();
+    // per-thread dedup tables on huge pages, sized for the largest bucket (random probes, TLB)
+    let max_n: usize = (0..NDB).map(|b| evbs.iter().map(|t| t.slice(b).len()).sum::<usize>()).max().unwrap_or(0);
+    let max_cap = (max_n * 2).next_power_of_two().max(16);
+    let dd_scratch: Vec<Mutex<Option<&'static mut [u64]>>> = (0..nworkers + 1).map(|_| Mutex::new(None)).collect();
     let ndup = AtomicUsize::new(0);
     (0..NDB).into_par_iter().for_each(|b| {
         let n: usize = evbs.iter().map(|t| t.slice(b).len()).sum();
@@ -1687,9 +1690,9 @@ fn main() {
         let mask = cap - 1;
         let w = rayon::current_thread_index().unwrap_or(nworkers);
         let mut tabg = dd_scratch[w].lock().unwrap();
-        tabg.clear();
-        tabg.resize(cap, 0);
-        let tab = &mut *tabg;
+        let full = tabg.get_or_insert_with(|| huge_slice::<u64>(max_cap));
+        let tab = &mut full[..cap];
+        tab.fill(0);
         let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize].slice(b)[(s & ((1 << 27) - 1)) as usize] };
         let mut dups = 0usize;
         for (t, part) in evbs.iter().enumerate() {
