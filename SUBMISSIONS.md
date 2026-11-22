@@ -18,3 +18,4 @@
 | Sat 21:36 | 9ef488b | + half-size event ring, division-free F3, unchecked ts loads | BB-EFA45B22: scored 1.4476 s (worse than 1.3173; scorer variance up to 20% -> A/B harness) |
 | Sat 21:48 | af3d7e5 (diag) | DIAGNOSTIC v4: per-kind parse stats | BB-F0CC7819: rejected on purpose. same-machine walls 1.39/1.26/1.23/1.24/1.36 s (+-10% noise); links .08, parse .78, dedup .056, sessions .235; parse thread-s events 5.5-6.4, clicks .95, links .15; sessions thread-s ev-sort .68, ck-sort .25, person .56, parquet .29 |
 | Sat 22:04 | d0faf23 (diag) | DIAGNOSTIC v5 A/B: f9eff02 vs HEAD 14655d0 (non-PGO, alternating x3, one machine) | BB-F47D57D2: A/B on one machine (non-PGO): base f9eff02 1238/1252/1283 ms vs new 14655d0 1182/1186 ms (-6%); parse .83->.775 |
+| Sat 22:16 | 43108d9 | + forced inlining of hot helpers, key masks, names by key, unchecked buckets, ingest F1 path | BB-F8DBAF42 queued |
