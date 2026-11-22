@@ -31,3 +31,4 @@
 - 2026-11-21 19:45 CST: Tried caching the key hash inside Key (24-byte keys): instructions +2%, reverted.
 - 2026-11-21 19:48 CST: Bucket slabs: each parse thread's 256+512+512 bucket streams now live in one 2 MB-aligned THP-advised slab per record type (regions sized to the 1.25x estimate; overflow moves a bucket to a heap Vec). Rationale: scorer parse is ~2.9x slower per thread than M-series; ~1280 4 KB-page write streams per thread (x2 with hyperthreads) overflow the STLB on x86. Neutral on macOS (16 KB pages). Spill path tested with SS_SLABCAP=1..3 (fixtures, dev, difftest).
 - 2026-11-21 19:52 CST: Sessions thread-time split at 10M: person 0.25, ev gather+sort 0.22, parquet 0.11, ck sort 0.10 (s, thread-sum).
+- 2026-11-21 20:12 CST: 7de0291 (bucket slabs on THP + 8-row prefetch ring + x86-64-v3) scored 1.5656 s vs 1.891 s: x86 TLB/DRAM-latency effects are real on the scorer; continuing to move randomly-accessed structures onto huge pages.
