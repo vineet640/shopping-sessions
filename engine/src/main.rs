@@ -582,7 +582,24 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
 #[inline(always)]
 fn delim_masks(b: &[u8]) -> (u64, u64, u64) {
     debug_assert!(b.len() >= 64);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm256_set1_epi8(b',' as i8);
+        let q = _mm256_set1_epi8(b'"' as i8);
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let (mut ms, mut mn, mut mq) = (0u64, 0u64, 0u64);
+        for k in 0..2 {
+            let v = _mm256_loadu_si256(b.as_ptr().add(32 * k) as *const __m256i);
+            let en = _mm256_cmpeq_epi8(v, nl);
+            let es = _mm256_or_si256(_mm256_cmpeq_epi8(v, c), en);
+            ms |= (_mm256_movemask_epi8(es) as u32 as u64) << (32 * k);
+            mn |= (_mm256_movemask_epi8(en) as u32 as u64) << (32 * k);
+            mq |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) as u32 as u64) << (32 * k);
+        }
+        (ms, mn, mq)
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     unsafe {
         use std::arch::x86_64::*;
         let c = _mm_set1_epi8(b',' as i8);
