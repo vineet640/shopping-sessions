@@ -26,11 +26,13 @@ t0=$(ns); /app/generate --seed 7 --events 20000000 --clicks 5000000 --output /sc
 du -sh /scratch/g10
 for i in 1 2 3; do
   rm -rf /scratch/o10; mkdir -p /scratch/o10
-  t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 /app/ss; t1=$(ns); echo "### 10M run $i wall: $(ms $t0 $t1) ms"
+  t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 /app/ss; t1=$(ns); echo "### 20M run $i wall: $(ms $t0 $t1) ms"
 done
 rm -rf /scratch/o10; mkdir -p /scratch/o10
-t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 NCPU=4 /app/ss; t1=$(ns); echo "### 10M NCPU=4 wall: $(ms $t0 $t1) ms"
+t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 SS_NOPOPULATE=1 /app/ss; t1=$(ns); echo "### 20M NOPOPULATE wall: $(ms $t0 $t1) ms"
 rm -rf /scratch/o10; mkdir -p /scratch/o10
-t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 NCPU=16 /app/ss; t1=$(ns); echo "### 10M NCPU=16 wall: $(ms $t0 $t1) ms"
+t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 NCPU=4 /app/ss; t1=$(ns); echo "### 20M NCPU=4 wall: $(ms $t0 $t1) ms"
+rm -rf /scratch/o10; mkdir -p /scratch/o10
+t0=$(ns); DATA_DIR=/scratch/g10 OUTPUT_DIR=/scratch/o10 NCPU=16 /app/ss; t1=$(ns); echo "### 20M NCPU=16 wall: $(ms $t0 $t1) ms"
 echo "=== DIAG END (exit 1 on purpose)"
 exit 1
