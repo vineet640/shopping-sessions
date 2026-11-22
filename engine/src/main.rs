@@ -946,6 +946,19 @@ struct PCk {
 }
 
 #[inline]
+/// first 8 bytes, big-endian, zero padded (lexicographic order of the prefix)
+#[inline]
+fn be8(s: &[u8]) -> u64 {
+    if s.len() >= 8 {
+        u64::from_be_bytes(s[..8].try_into().unwrap())
+    } else {
+        let mut b = [0u8; 8];
+        b[..s.len()].copy_from_slice(s);
+        u64::from_be_bytes(b)
+    }
+}
+
+#[allow(dead_code)]
 fn be16(s: &[u8]) -> (u64, u64) {
     let mut b = [0u8; 16];
     let n = s.len().min(16);
@@ -1183,7 +1196,7 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 ($pp:expr) => {{
                     let (uk, ui, us, tsr, camp, id): (Key, usize, &[u8], u64, u16, &[u8]) = $pp;
                     let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
-                    let (b0, _) = be16(id);
+                    let b0 = be8(id);
                     let o = id.as_ptr() as usize - base.as_ptr() as usize;
                     ckb.push(pbucket(root, cx.pshift), PCk {
                         key: ((root as u64) << cx.tbits) | tsr,
