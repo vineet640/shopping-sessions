@@ -1587,7 +1587,16 @@ fn main() {
             outs.iter().flat_map(|o| std::mem::take(&mut o.lock().unwrap().links)).collect();
         // concurrent union-find: link the larger root under the smaller with CAS, path halving.
         // Invariant parent[x] <= x, so every walk terminates and the root is the smallest slot.
-        let parent: Vec<AtomicU32> = (0..cap as u32).into_par_iter().map(AtomicU32::new).collect();
+        // huge pages: random probes during union-find
+        let parent: &'static [AtomicU32] = {
+            let raw = huge_slice::<u32>(cap);
+            raw.par_chunks_mut(1 << 16).enumerate().for_each(|(c, ch)| {
+                for (j, x) in ch.iter_mut().enumerate() {
+                    *x = (c * (1 << 16) + j) as u32;
+                }
+            });
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const AtomicU32, cap) }
+        };
         let find = |mut x: u32| -> u32 {
             loop {
                 let p = parent[x as usize].load(Ordering::Relaxed);
@@ -1615,7 +1624,15 @@ fn main() {
                 }
             }
         });
-        let root: Vec<u32> = (0..cap as u32).into_par_iter().map(|i| find(i)).collect();
+        let root: &'static [u32] = {
+            let raw = huge_slice::<u32>(cap);
+            raw.par_chunks_mut(1 << 16).enumerate().for_each(|(c, ch)| {
+                for (j, x) in ch.iter_mut().enumerate() {
+                    *x = find((c * (1 << 16) + j) as u32);
+                }
+            });
+            raw
+        };
         root.par_iter().enumerate().for_each(|(i, &r)| {
             if r as usize != i {
                 tab.set_root(i, r);
@@ -1710,7 +1727,10 @@ fn main() {
     // per-thread dedup tables on huge pages, sized for the largest bucket (random probes, TLB)
     let max_n: usize = (0..NDB).map(|b| evbs.iter().map(|t| t.slice(b).len()).sum::<usize>()).max().unwrap_or(0);
     let max_cap = (max_n * 2).next_power_of_two().max(16);
-    let dd_scratch: Vec<Mutex<Option<&'static mut [u64]>>> = (0..nworkers + 1).map(|_| Mutex::new(None)).collect();
+    // allocated here, outside the parallel loop: huge_slice uses rayon internally, and running
+    // nested rayon work while holding a worker's lock can deadlock (work stealing re-enters)
+    let dd_scratch: Vec<Mutex<&'static mut [u64]>> =
+        (0..nworkers + 1).map(|_| Mutex::new(huge_slice::<u64>(max_cap))).collect();
     let ndup = AtomicUsize::new(0);
     (0..NDB).into_par_iter().for_each(|b| {
         let n: usize = evbs.iter().map(|t| t.slice(b).len()).sum();
@@ -1718,8 +1738,7 @@ fn main() {
         let mask = cap - 1;
         let w = rayon::current_thread_index().unwrap_or(nworkers);
         let mut tabg = dd_scratch[w].lock().unwrap();
-        let full = tabg.get_or_insert_with(|| huge_slice::<u64>(max_cap));
-        let tab = &mut full[..cap];
+        let tab = &mut tabg[..cap];
         tab.fill(0);
         let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize].slice(b)[(s & ((1 << 27) - 1)) as usize] };
         let mut dups = 0usize;
