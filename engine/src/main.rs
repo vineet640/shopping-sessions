@@ -985,16 +985,34 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
             }
         }
         Kind::Ln => {
+            // pipelined: prefetch both slots, insert one line later
+            let mut pending: Option<(Key, &[u8], Key, &[u8])> = None;
+            macro_rules! finish_ln {
+                ($pp:expr) => {{
+                    let (ka, sa, kb, sb): (Key, &[u8], Key, &[u8]) = $pp;
+                    let a = cx.tab.insert(ka, sa, arena, w, newids).0;
+                    let b = cx.tab.insert(kb, sb, arena, w, newids).0;
+                    if a != b {
+                        links.push((a, b));
+                    }
+                }};
+            }
             nlines[2] += for_lines::<2, _>(data, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let a = cx.tab.insert(key_at(f[0], avail(f[0])), f[0], arena, w, newids).0;
-                let b = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).0;
-                if a != b {
-                    links.push((a, b));
+                let ka = key_at(f[0], avail(f[0]));
+                let kb = key_at(f[1], avail(f[1]));
+                cx.tab.prefetch(ka);
+                cx.tab.prefetch(kb);
+                if let Some(pp) = pending.take() {
+                    finish_ln!(pp);
                 }
+                pending = Some((ka, f[0], kb, f[1]));
             });
+            if let Some(pp) = pending.take() {
+                finish_ln!(pp);
+            }
         }
     }
 }
