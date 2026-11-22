@@ -663,22 +663,22 @@ impl IdTable {
 // ---------------------------------------------------------------- records
 
 #[derive(Clone, Copy)]
+/// Dedup record (every well-formed event with an event_id): key, ingest_ts and where its
+/// person-bucket row lives (NONE if the copy is invalid).
 struct Ev {
     klo: u64,
     khi: u64,
     ing: i64,
-    ts: u32, // ms since cws (valid events only)
-    root: u32,
-    price: u32, // 0 unless purchase
-    cat: u16,
-    ok: bool,
+    r: u64, // thread << 56 | person bucket << 40 | index, or NONE
 }
+const NONE: u64 = u64::MAX;
 
 #[derive(Clone, Copy)]
 struct PEv {
     key: u64,
     price: u32,
     cat: u16,
+    dead: bool, // set by dedup when a copy with a smaller ingest_ts exists
 }
 
 #[derive(Clone, Copy)]
@@ -703,6 +703,7 @@ fn be16(s: &[u8]) -> (u64, u64) {
 struct ParseOut {
     arena: Vec<u8>,
     evb: Vec<Vec<Ev>>,
+    pev: Vec<Vec<PEv>>,
     ckb: Vec<Vec<PCk>>,
     links: Vec<(u32, u32)>,
     nlines: [u64; 3],
@@ -751,10 +752,22 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let data = &base[rs..re];
     let bend = base.as_ptr() as usize + base.len();
     let avail = |f: &[u8]| bend - f.as_ptr() as usize;
-    let ParseOut { arena, evb, ckb, links, nlines, newids, dc } = out;
+    let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut pending: Option<(Ev, Key, &[u8], Key)> = None;
+            let mut pending: Option<(Key, i64, u64, u32, u16, Key, &[u8])> = None;
+            let tbits = cx.tbits;
+            macro_rules! finish_ev {
+                ($pp:expr) => {{
+                    let (k, ing, tsr, price, cat, uk, us): (Key, i64, u64, u32, u16, Key, &[u8]) = $pp;
+                    let root = cx.tab.insert(uk, us, arena, w, newids).1;
+                    let pb = pbucket(root);
+                    let v = &mut pev[pb];
+                    let r = ((w as u64) << 56) | ((pb as u64) << 40) | v.len() as u64;
+                    v.push(PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
+                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(Ev { klo: k.lo, khi: k.hi, ing, r });
+                }};
+            }
             nlines[0] += for_lines::<7, _>(data, |f| {
                 if f[0].is_empty() {
                     return;
@@ -784,24 +797,21 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 if ok && ing - ts > LATE {
                     ok = false;
                 }
-                let mut e = Ev { klo: k.lo, khi: k.hi, ing, ts: (ts - cx.cws) as u32, root: 0, price, cat: 0, ok };
                 if ok {
                     // software pipeline: prefetch this row's id slot, finish the previous row's insert
                     let uk = key_at(f[1], avail(f[1]));
                     cx.tab.prefetch(uk);
-                    e.cat = cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat);
-                    if let Some((mut pe, puk, pus, pk)) = pending.take() {
-                        pe.root = cx.tab.insert(puk, pus, arena, w, newids).1;
-                        evb[(mix(pk) >> (64 - DB_BITS)) as usize].push(pe);
+                    let cat = cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat);
+                    if let Some(pp) = pending.take() {
+                        finish_ev!(pp);
                     }
-                    pending = Some((e, uk, f[1], k));
+                    pending = Some((k, ing, (ts - cx.cws) as u64, price, cat, uk, f[1]));
                 } else {
-                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(e);
+                    evb[(mix(k) >> (64 - DB_BITS)) as usize].push(Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 }
             });
-            if let Some((mut pe, puk, pus, pk)) = pending.take() {
-                pe.root = cx.tab.insert(puk, pus, arena, w, newids).1;
-                evb[(mix(pk) >> (64 - DB_BITS)) as usize].push(pe);
+            if let Some(pp) = pending.take() {
+                finish_ev!(pp);
             }
         }
         Kind::Ck => {
@@ -1070,6 +1080,7 @@ fn main() {
     let ck_bytes: usize = paths.iter().enumerate().filter(|(_, p)| p.0 == Kind::Ck).map(|(i, _)| files.b[i].get().len()).sum();
     let nworkers = nthreads;
     let per_db = ev_bytes / 70 / nworkers / NDB * 5 / 4 + 16;
+    let per_pb = ev_bytes / 70 / nworkers / NPB * 5 / 4 + 16;
     let per_pbc = ck_bytes / 45 / nworkers / NPB * 5 / 4 + 16;
 
     let mut cap = (total / 600).next_power_of_two().max(1 << 16);
@@ -1081,6 +1092,7 @@ fn main() {
             .map(|_| {
                 Mutex::new(ParseOut {
                     evb: (0..NDB).map(|_| Vec::with_capacity(per_db)).collect(),
+                    pev: (0..NPB).map(|_| Vec::with_capacity(per_pb)).collect(),
                     ckb: (0..NPB).map(|_| Vec::with_capacity(per_pbc)).collect(),
                     ..Default::default()
                 })
@@ -1191,16 +1203,29 @@ fn main() {
     log!("parsed: {} event lines, {} click lines, {} link lines; {} ids (cap {})", nl[0], nl[1], nl[2], nids, cap);
     let arenas = Arenas { a: outs.iter_mut().map(|o| std::mem::take(&mut o.arena)).collect() };
 
-    // ---- C: dedup events -> person buckets
+    // ---- C: dedup. One pass per event-id bucket with an L2-sized table; when two copies of an
+    // event meet, the one with the larger ingest_ts (or the later one on a tie: copies with equal
+    // ingest_ts are identical) is killed in place in its person bucket.
     let evbs: Vec<Vec<Vec<Ev>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.evb)).collect();
+    let mut pevs: Vec<Vec<Vec<PEv>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.pev)).collect();
     let ckbs: Vec<Vec<Vec<PCk>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ckb)).collect();
-    let per_pb = ev_bytes / 70 / nworkers / NPB * 5 / 4 + 16;
-    let routed: Vec<Mutex<Vec<Vec<PEv>>>> =
-        (0..nworkers + 1).map(|_| Mutex::new((0..NPB).map(|_| Vec::with_capacity(per_pb)).collect())).collect();
+    struct Ptrs(Vec<Vec<*mut PEv>>);
+    unsafe impl Sync for Ptrs {}
+    unsafe impl Send for Ptrs {}
+    let pptr = Ptrs(pevs.iter_mut().map(|t| t.iter_mut().map(|v| v.as_mut_ptr()).collect()).collect());
+    let pptr = &pptr;
+    let kill = |r: u64| {
+        if r != NONE {
+            let t = (r >> 56) as usize;
+            let pb = ((r >> 40) & 0xFFFF) as usize;
+            let i = (r & ((1 << 40) - 1)) as usize;
+            // distinct copies are distinct rows: no two threads write the same element
+            unsafe { (*pptr.0[t][pb].add(i)).dead = true };
+        }
+    };
     let dd_scratch: Vec<Mutex<Vec<u64>>> = (0..nworkers + 1).map(|_| Mutex::new(Vec::new())).collect();
-    let nsurv = AtomicUsize::new(0);
+    let ndup = AtomicUsize::new(0);
     (0..NDB).into_par_iter().for_each(|b| {
-        // slot = tag32 << 32 | t << 27 | index ; keeps the copy with the smallest ingest_ts
         let n: usize = evbs.iter().map(|t| t[b].len()).sum();
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
@@ -1210,6 +1235,7 @@ fn main() {
         tabg.resize(cap, 0);
         let tab = &mut *tabg;
         let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize][b][(s & ((1 << 27) - 1)) as usize] };
+        let mut dups = 0usize;
         for (t, part) in evbs.iter().enumerate() {
             for (k, e) in part[b].iter().enumerate() {
                 let m = mix(Key { lo: e.klo, hi: e.khi });
@@ -1225,8 +1251,12 @@ fn main() {
                     if s >> 32 == tag {
                         let o = get(s);
                         if o.klo == e.klo && o.khi == e.khi {
+                            dups += 1;
                             if e.ing < o.ing {
+                                kill(o.r);
                                 tab[i] = me;
+                            } else {
+                                kill(e.r);
                             }
                             break;
                         }
@@ -1235,46 +1265,11 @@ fn main() {
                 }
             }
         }
-        let mut r = routed[w].lock().unwrap();
-        let mut cnt = 0;
-        // second pass in source order: keep a record iff it is its group's winner
-        for (t, part) in evbs.iter().enumerate() {
-            for (k, e) in part[b].iter().enumerate() {
-                if !e.ok {
-                    continue;
-                }
-                let m = mix(Key { lo: e.klo, hi: e.khi });
-                let tag = ((m >> 32) | 1) & 0xFFFF_FFFF;
-                let me = (tag << 32) | ((t as u64) << 27) | k as u64;
-                let mut i = m as usize & mask;
-                let win = loop {
-                    let s = tab[i];
-                    if s == me {
-                        break true;
-                    }
-                    if s >> 32 == tag {
-                        let o = get(s);
-                        if o.klo == e.klo && o.khi == e.khi {
-                            break false;
-                        }
-                    }
-                    i = (i + 1) & mask;
-                };
-                if win {
-                    r[pbucket(e.root)].push(PEv {
-                        key: ((e.root as u64) << tbits) | e.ts as u64,
-                        price: e.price,
-                        cat: e.cat,
-                    });
-                    cnt += 1;
-                }
-            }
-        }
-        nsurv.fetch_add(cnt, Ordering::Relaxed);
+        ndup.fetch_add(dups, Ordering::Relaxed);
     });
     std::mem::forget(evbs);
-    log!("dedup: {} surviving events", nsurv.load(Ordering::Relaxed));
-    let routed: Vec<Vec<Vec<PEv>>> = routed.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    log!("dedup: {} duplicate copies", ndup.load(Ordering::Relaxed));
+    let routed = pevs;
 
     // ---- D: per person bucket
     let ws_day = ws.div_euclid(DAY);
@@ -1314,7 +1309,7 @@ fn main() {
             ev.clear();
             ck.clear();
             for t in &routed {
-                ev.extend_from_slice(&t[b]);
+                ev.extend(t[b].iter().filter(|e| !e.dead).copied());
             }
             radix_sort(&mut ev, &mut wk.ev_tmp, kbits, |e| e.key);
             for t in &ckbs {
