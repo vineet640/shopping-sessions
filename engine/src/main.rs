@@ -1524,6 +1524,11 @@ fn main() {
     all.push(data.join("products.csv"));
     all.push(data.join("campaigns.csv"));
     let files = Files { b: all.par_iter().map(|p| open(p)).collect() };
+    if std::env::var_os("SS_PRETOUCH").is_some() {
+        // profiling aid: fault in every input page up front (macOS has no MAP_POPULATE)
+        let s: u64 = files.b.par_iter().map(|b| b.get().iter().step_by(4096).map(|&x| x as u64).sum::<u64>()).sum();
+        log!("pretouched ({s})");
+    }
     let total: usize = files.b.iter().map(|b| b.get().len()).sum();
     log!("{} csv files, {:.1} MB, {} threads", all.len(), total as f64 / 1e6, nthreads);
 

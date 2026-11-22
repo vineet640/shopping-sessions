@@ -36,3 +36,4 @@
 - 2026-11-21 20:46 CST: PGO build: Dockerfile runs scripts/pgo_build.sh (our own synthetic training data from tools/traingen, 2M events -> instrumented build -> training run -> llvm-profdata merge -> profile-use build, x86-64-v3). Synthetic-trained profile ~= real-trained (instr -12%, wall ~-4..7% locally). Local script run 2m47s (two fat-LTO builds); scorer build limit 10 min.
 - 2026-11-21 21:10 CST: Tried a u128 (time,prefix) sort key for per-person click sorts: no gain, reverted.
 - 2026-11-21 21:12 CST: Organizers raised the quota to 5/hour (user relayed). New spacing: >= 12 min between submissions (instead of 31).
+- 2026-11-21 21:19 CST: 60M re-check with HEAD: output == v1 (6,689,856 user_daily rows), 30.7 s on the 8 GB Mac while swapping (limit 180 s).
