@@ -532,16 +532,17 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
             if nf + 1 == N {
                 bounds[nf] = (fstart, end);
                 let mut fs: [&'a [u8]; N] = [&[]; N];
+                // positions come from the delimiter masks of `data`: always in range, s <= e
                 if lq == 0 {
                     for k in 0..N {
-                        fs[k] = &data[bounds[k].0..bounds[k].1];
+                        fs[k] = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
                     }
                     f(&fs);
                 } else {
                     let mut ok = true;
                     let mut qf = 0u32;
                     for k in 0..N {
-                        let v = &data[bounds[k].0..bounds[k].1];
+                        let v = unsafe { data.get_unchecked(bounds[k].0..bounds[k].1) };
                         if !v.is_empty() && v[0] == b'"' {
                             let l = v.len();
                             if l < 2 || v[l - 1] != b'"' {
@@ -583,7 +584,7 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
             let p = blk + i as usize;
             if (nlm >> i) & 1 == 0 {
                 if nf < N {
-                    bounds[nf] = (fstart, p);
+                    unsafe { *bounds.get_unchecked_mut(nf) = (fstart, p) };
                 }
                 nf += 1;
                 fstart = p + 1;
@@ -2581,5 +2582,32 @@ mod ts_bench {
         }
         let ns = t.elapsed().as_nanos() as f64 / (5 * v.len()) as f64;
         eprintln!("key(): {ns:.1} ns (acc {acc})");
+    }
+}
+
+#[cfg(test)]
+mod tok_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_for_lines() {
+        let path = std::env::var("TOK_FILE").unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let body = &data[data.iter().position(|&c| c == b'\n').unwrap() + 1..data.len() - 1];
+        let mut lines = 0u64;
+        let mut acc = 0usize;
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            lines += for_lines::<7, _>(body, |f| {
+                acc = acc.wrapping_add(f[0].len() + f[6].len());
+            });
+        }
+        let el = t.elapsed();
+        eprintln!(
+            "for_lines: {:.1} ns/line, {:.2} GB/s ({} lines, acc {acc})",
+            el.as_nanos() as f64 / lines as f64,
+            (5 * body.len()) as f64 / el.as_secs_f64() / 1e9,
+            lines / 5
+        );
     }
 }
