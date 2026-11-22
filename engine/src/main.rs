@@ -1129,7 +1129,8 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
             macro_rules! finish_ev {
                 ($pp:expr) => {{
                     let (k, ing, tsr, price, pk, pi, uk, ui, us): (Key, i64, u64, u32, Key, usize, Key, usize, &[u8]) = $pp;
-                    let cat = cx.products.get_at(pk, pi).unwrap_or(cx.unknown_cat);
+                    // category only matters for purchases (top_category); views/carts skip the lookup
+                    let cat = if pi != usize::MAX { cx.products.get_at(pk, pi).unwrap_or(cx.unknown_cat) } else { 0 };
                     let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
                     let pb = pbucket(root, cx.pshift);
                     let i = pev.push(pb, PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
@@ -1170,8 +1171,12 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     // software pipeline: prefetch this row's id slot, finish the previous row's insert
                     let uk = key_at(f[1], avail(f[1]));
                     let ui = cx.tab.prefetch(uk);
-                    let pk = key_at(f[5], avail(f[5]));
-                    let pi = cx.products.prefetch(pk);
+                    let (pk, pi) = if price > 0 {
+                        let pk = key_at(f[5], avail(f[5]));
+                        (pk, cx.products.prefetch(pk))
+                    } else {
+                        (Key::default(), usize::MAX)
+                    };
                     let slot = rpos % PF;
                     rpos += 1;
                     if let Some(pp) = ring[slot].take() {
