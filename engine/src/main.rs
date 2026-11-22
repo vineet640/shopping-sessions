@@ -35,6 +35,7 @@ const PF: usize = 8; // rows in flight between id-slot prefetch and insert (hide
 
 static STATS: AtomicBool = AtomicBool::new(false);
 static SI: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static SP: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 macro_rules! log {
     ($($a:tt)*) => {{
@@ -1118,6 +1119,22 @@ fn pbucket(r: u32, pshift: u32) -> usize {
 }
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
+    if STATS.load(Ordering::Relaxed) {
+        let t = Instant::now();
+        parse_chunk_inner(cx, c, w, out);
+        let k = match c.kind {
+            Kind::Ev => 0,
+            Kind::Ck => 1,
+            Kind::Ln => 2,
+        };
+        SP[k].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    } else {
+        parse_chunk_inner(cx, c, w, out);
+    }
+}
+
+#[inline(always)]
+fn parse_chunk_inner(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let base = cx.files.b[c.fi].get();
     #[cfg(target_os = "linux")]
     if popmode() == PopMode::Chunk {
@@ -1759,6 +1776,10 @@ fn main() {
     let nl: [u64; 3] = outs.iter().fold([0; 3], |a, o| [a[0] + o.nlines[0], a[1] + o.nlines[1], a[2] + o.nlines[2]]);
     let nids: usize = outs.iter().map(|o| o.newids).sum();
     log!("parsed: {} event lines, {} click lines, {} link lines; {} ids (cap {})", nl[0], nl[1], nl[2], nids, cap);
+    if STATS.load(Ordering::Relaxed) {
+        let g = |k: usize| SP[k].load(Ordering::Relaxed) as f64 / 1e9;
+        log!("stats parse thread-s: events {:.3} clicks {:.3} links {:.3}", g(0), g(1), g(2));
+    }
     if std::env::var_os("SS_STOP_AFTER_PARSE").is_some() {
         std::process::exit(0); // profiling aid
     }

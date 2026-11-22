@@ -15,3 +15,4 @@
 | Sat 21:04 | e62793b | PGO build (own traingen) + single-pass person radix + F3 SWAR + hash-once rings + dedup hash ring | BB-083322C0: SCORED 1.4165 s (best; PGO build works on scorer) |
 | Sat 21:12 | cb39308 (diag) | DIAGNOSTIC v3: PGO engine, SS_STATS, populate modes | BB-6E258916: rejected on purpose. PGO engine 20M wall 1.27 s: links .073, parse .83 (68%), dedup .055, sessions .24, write .024; populate map slower |
 | Sat 21:24 | f9eff02 | + names batched, parquet batched, span fast path, category only for purchases | BB-0A2D8C48: SCORED 1.3173 s (best) |
+| Sat 21:36 | 9ef488b | + half-size event ring, division-free F3, unchecked ts loads | BB-EFA45B22 queued |
