@@ -64,7 +64,9 @@ fn open(path: &Path) -> Bytes {
     }
     let mut o = memmap2::MmapOptions::new();
     #[cfg(target_os = "linux")]
-    o.populate();
+    if std::env::var_os("SS_NOPOPULATE").is_none() {
+        o.populate();
+    }
     let m = unsafe { o.map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     Bytes::Map(m)
 }
@@ -494,7 +496,27 @@ fn delim_mask(b: &[u8]) -> u64 {
         }
         m
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let w = vld1q_u8(W.as_ptr());
+        let c = vdupq_n_u8(b',');
+        let q = vdupq_n_u8(b'"');
+        let nl = vdupq_n_u8(b'\n');
+        let p = b.as_ptr();
+        let m = |k: usize| {
+            let v = vld1q_u8(p.add(16 * k));
+            let e = vorrq_u8(vorrq_u8(vceqq_u8(v, c), vceqq_u8(v, q)), vceqq_u8(v, nl));
+            vandq_u8(e, w)
+        };
+        let s0 = vpaddq_u8(m(0), m(1));
+        let s1 = vpaddq_u8(m(2), m(3));
+        let s = vpaddq_u8(s0, s1);
+        let s = vpaddq_u8(s, s);
+        vgetq_lane_u64(vreinterpretq_u64_u8(s), 0)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         #[inline(always)]
         fn eq(x: u64, t: u64) -> u64 {
