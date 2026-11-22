@@ -201,7 +201,7 @@ struct SmallMap {
     mask: usize,
     e: &'static mut [SmEntry],
 }
-fn huge_slice<T: Copy + Default>(n: usize) -> &'static mut [T] {
+fn huge_slice<T: Copy + Default + Send>(n: usize) -> &'static mut [T] {
     const HP: usize = 2 << 20;
     let bytes = (n * std::mem::size_of::<T>()).max(1).div_ceil(HP) * HP;
     let layout = std::alloc::Layout::from_size_align(bytes, HP).unwrap();
@@ -211,9 +211,16 @@ fn huge_slice<T: Copy + Default>(n: usize) -> &'static mut [T] {
     unsafe {
         libc::madvise(p as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
     }
-    for i in 0..n {
-        unsafe { p.add(i).write(T::default()) };
-    }
+    struct P<T>(*mut T);
+    unsafe impl<T> Sync for P<T> {}
+    let pp = P(p);
+    let pp = &pp;
+    const CHK: usize = 1 << 16;
+    (0..n.div_ceil(CHK)).into_par_iter().for_each(|c| {
+        for i in c * CHK..((c + 1) * CHK).min(n) {
+            unsafe { pp.0.add(i).write(T::default()) };
+        }
+    });
     unsafe { std::slice::from_raw_parts_mut(p, n) }
 }
 impl SmallMap {
@@ -1601,9 +1608,10 @@ fn main() {
             let o = (p.off & ((1 << 40) - 1)) as usize;
             &arenas_a[(p.off >> 40) as usize].arena[o..o + p.len as usize]
         };
-        let name1: Vec<AtomicU32> = {
-            let mut v = std::mem::ManuallyDrop::new(vec![0u32; cap]);
-            unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, v.len(), v.capacity()) }
+        // huge pages: read once per person, at random, in the sessions phase
+        let name1: &'static [AtomicU32] = {
+            let raw = huge_slice::<u32>(cap);
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const AtomicU32, cap) }
         };
         links.par_iter().for_each(|&(a, b)| {
             for x in [a, b] {
