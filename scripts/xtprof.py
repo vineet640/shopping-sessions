@@ -42,3 +42,21 @@ print("--- inclusive (ss:: only)")
 for k, v in incl.most_common(200):
     if "ss::" in k or "main" in k:
         print(f"{100*v/total:5.1f}%  {k}")
+
+if len(sys.argv) > 3:
+    # callers of a leaf function: python xtprof.py X.xml N LEAF
+    leaf = sys.argv[3]
+    callers = collections.Counter()
+    for names in bts.values():
+        pass
+    for row in root.iter("row"):
+        tb = row.find("tagged-backtrace")
+        if tb is None:
+            continue
+        key = "t" + tb.attrib.get("ref", tb.attrib.get("id", ""))
+        names = bts.get(key, [])
+        if names and short(names[0]) == leaf and len(names) > 1:
+            callers[" <- ".join(short(x)[:50] for x in names[1:4])] += 1
+    print("--- callers of", leaf)
+    for k, v in callers.most_common(8):
+        print(v, k)

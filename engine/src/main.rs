@@ -276,9 +276,41 @@ fn p8(b: &[u8]) -> Option<u64> {
 
 #[derive(Default)]
 struct DateCache {
-    k0: u64,
-    k1: u16,
-    day: i64,
+    ybase: i64,
+    days: Vec<i32>, // [(y - ybase) * 372 + (m - 1) * 31 + (d - 1)] = epoch day, or i32::MIN if impossible
+}
+const DC_YEARS: i64 = 6;
+impl DateCache {
+    /// Day table for the years around `ws` (other years take the general path).
+    fn new(ws: i64) -> Self {
+        let ybase = 1970 + ws.div_euclid(DAY) * 400 / 146_097 - 3;
+        let mut days = vec![i32::MIN; (DC_YEARS * 372) as usize];
+        for yi in 0..DC_YEARS {
+            for m in 1..=12i64 {
+                for d in 1..=31i64 {
+                    let y = ybase + yi;
+                    let s = format!("{:04}-{:02}-{:02}", y, m, d);
+                    if let Some(v) = parse_date(s.as_bytes()) {
+                        days[(yi * 372 + (m - 1) * 31 + (d - 1)) as usize] = v as i32;
+                    }
+                }
+            }
+        }
+        DateCache { ybase, days }
+    }
+}
+
+/// 8 ASCII digits? (little-endian word)
+#[inline(always)]
+fn digits8(x: u64) -> bool {
+    (x & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+}
+/// 8 digits -> four 2-digit values in 16-bit lanes (lane 0 = first two characters)
+#[inline(always)]
+fn pairs8(x: u64) -> u64 {
+    let v = x - 0x3030_3030_3030_3030;
+    (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF
 }
 
 /// F1 / F2 / F3 -> epoch ms. None = bad timestamp (F3 beyond i64 included).
@@ -290,26 +322,39 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     }
     if n == 20 || n == 25 {
         if f[4] == b'-' {
-            if f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+            let w0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(f[8..16].try_into().unwrap());
+            let w2 = u32::from_le_bytes(f[16..20].try_into().unwrap()) as u64;
+            if (w0 >> 56) as u8 != b'-' || (w1 >> 16) as u8 != b'T' || (w1 >> 40) as u8 != b':' || w2 as u8 != b':' {
                 return None;
             }
-            let k0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
-            let k1 = u16::from_le_bytes(f[8..10].try_into().unwrap());
-            let day = if k0 == dc.k0 && k1 == dc.k1 && dc.k0 != 0 {
-                dc.day
-            } else {
-                let d = parse_date(f)?;
-                dc.k0 = k0;
-                dc.k1 = k1;
-                dc.day = d;
-                d
-            };
-            let h = d2(f, 11)?;
-            let mi = d2(f, 14)?;
-            let s = d2(f, 17)?;
+            // YYYYMMDD and hhmmss00 as digit words
+            let da = (w0 & 0xFFFF_FFFF) | (((w0 >> 40) & 0xFFFF) << 32) | ((w1 & 0xFFFF) << 48);
+            let ta = ((w1 >> 24) & 0xFFFF) | (((w1 >> 48) & 0xFFFF) << 16) | (((w2 >> 8) & 0xFFFF) << 32) | (0x3030u64 << 48);
+            if !digits8(da) || !digits8(ta) {
+                return None;
+            }
+            let pd = pairs8(da);
+            let pt = pairs8(ta);
+            let y = ((pd & 0xFF) * 100 + ((pd >> 16) & 0xFF)) as i64;
+            let mo = ((pd >> 32) & 0xFF) as i64;
+            let d = ((pd >> 48) & 0xFF) as i64;
+            let h = (pt & 0xFF) as i64;
+            let mi = ((pt >> 16) & 0xFF) as i64;
+            let s = ((pt >> 32) & 0xFF) as i64;
             if h > 23 || mi > 59 || s > 59 {
                 return None;
             }
+            let yi = y - dc.ybase;
+            let day = if (0..DC_YEARS).contains(&yi) && (1..=12).contains(&mo) && (1..=31).contains(&d) && !dc.days.is_empty() {
+                let v = dc.days[(yi * 372 + (mo - 1) * 31 + (d - 1)) as usize];
+                if v == i32::MIN {
+                    return None;
+                }
+                v as i64
+            } else {
+                parse_date(f)?
+            };
             let off = if n == 20 {
                 if f[19] != b'Z' {
                     return None;
@@ -1150,6 +1195,7 @@ fn main() {
                     evb: (0..NDB).map(|_| Vec::with_capacity(per_db)).collect(),
                     pev: (0..NPB).map(|_| Vec::with_capacity(per_pb)).collect(),
                     ckb: (0..NPB).map(|_| Vec::with_capacity(per_pbc)).collect(),
+                    dc: DateCache::new(ws),
                     ..Default::default()
                 })
             })
@@ -1742,4 +1788,150 @@ fn write_outputs(
     let mut w = ArrowWriter::try_new(f, cd_schema, Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
+}
+
+
+#[cfg(test)]
+mod ts_fuzz {
+    use super::*;
+    #[derive(Default)]
+    struct OldCache {
+        k0: u64,
+        k1: u16,
+        day: i64,
+    }
+    /// previous implementation (reference) -> epoch ms. None = bad timestamp (F3 beyond i64 included).
+    #[inline]
+    fn old_parse_ts(f: &[u8], dc: &mut OldCache) -> Option<i64> {
+        let n = f.len();
+        if n == 0 {
+            return None;
+        }
+        if n == 20 || n == 25 {
+            if f[4] == b'-' {
+                if f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+                    return None;
+                }
+                let k0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
+                let k1 = u16::from_le_bytes(f[8..10].try_into().unwrap());
+                let day = if k0 == dc.k0 && k1 == dc.k1 && dc.k0 != 0 {
+                    dc.day
+                } else {
+                    let d = parse_date(f)?;
+                    dc.k0 = k0;
+                    dc.k1 = k1;
+                    dc.day = d;
+                    d
+                };
+                let h = d2(f, 11)?;
+                let mi = d2(f, 14)?;
+                let s = d2(f, 17)?;
+                if h > 23 || mi > 59 || s > 59 {
+                    return None;
+                }
+                let off = if n == 20 {
+                    if f[19] != b'Z' {
+                        return None;
+                    }
+                    0
+                } else {
+                    let sign = match f[19] {
+                        b'+' => 1,
+                        b'-' => -1,
+                        _ => return None,
+                    };
+                    if f[22] != b':' {
+                        return None;
+                    }
+                    let oh = d2(f, 20)?;
+                    let om = d2(f, 23)?;
+                    if oh > 23 || om > 59 {
+                        return None;
+                    }
+                    sign * (oh * 60 + om) * 60_000
+                };
+                return Some(day * DAY + h * 3_600_000 + mi * 60_000 + s * 1000 - off);
+            }
+        }
+        // F3: digits only
+        let mut i = 0;
+        while i < n && f[i] == b'0' {
+            i += 1;
+        }
+        let r = &f[i..];
+        let m = r.len();
+        if m > 19 {
+            // too long for i64 if all digits; either way bad
+            return None;
+        }
+        let mut v: u64 = 0;
+        let mut j = 0;
+        while j + 8 <= m {
+            v = v * 100_000_000 + p8(&r[j..j + 8])?;
+            j += 8;
+        }
+        while j < m {
+            let c = r[j].wrapping_sub(b'0');
+            if c > 9 {
+                return None;
+            }
+            v = v.wrapping_mul(10).wrapping_add(c as u64);
+            j += 1;
+        }
+        // m <= 19 digits: at most 9_999_999_999_999_999_999 which may exceed u64? no: u64 max ~1.8e19
+        if m == 19 && r[0] > b'1' {
+            // >= 2e18 .. 9.99e18 fits u64; check i64 below
+        }
+        if v > i64::MAX as u64 {
+            return None;
+        }
+        Some(v as i64)
+    }
+
+
+    #[test]
+    fn new_matches_old() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let ws = parse_ts(b"2028-02-20T00:00:00Z", &mut DateCache::default()).unwrap();
+        let mut dc = DateCache::new(ws);
+        let mut oc = OldCache::default();
+        let bases: Vec<String> = vec![
+            "2028-02-29T23:59:59Z".into(), "2027-02-29T10:00:00Z".into(), "2028-12-31T00:00:00+05:30".into(),
+            "2026-01-01T00:00:00-00:00".into(), "2028-03-01T12:34:56-10:00".into(), "1999-07-04T01:02:03Z".into(),
+            "2100-02-29T00:00:00Z".into(), "2028-02-30T00:00:00Z".into(), "1791071890000".into(), "0001791071890000".into(),
+            "2028-04-31T00:00:00Z".into(), "2028-13-01T00:00:00Z".into(), "2028-00-10T00:00:00Z".into(), "2028-01-00T00:00:00Z".into(),
+            "2028-06-15T24:00:00Z".into(), "2028-06-15T23:60:00Z".into(), "2028-06-15T23:00:60Z".into(), "2028-06-15T23:00:00+24:00".into(),
+            "2028-06-15T23:00:00+05:60".into(), "2028-06-15T23:00:00+0500".into(), "2028-06-15 23:00:00Z".into(), "2028-06-15t23:00:00z".into(),
+            "99999999999999999999".into(), "9223372036854775807".into(), "9223372036854775808".into(), "00000000000000000000".into(),
+        ];
+        let alphabet = b"0123456789-T:Z+ zt.e";
+        let mut n = 0;
+        for round in 0..3_000_000u64 {
+            let mut s = bases[(rnd() % bases.len() as u64) as usize].clone().into_bytes();
+            let muts = rnd() % 4;
+            for _ in 0..muts {
+                let op = rnd() % 10;
+                if s.is_empty() { break; }
+                let i = (rnd() % s.len() as u64) as usize;
+                match op {
+                    0..=5 => s[i] = b'0' + (rnd() % 10) as u8,
+                    6 => s[i] = alphabet[(rnd() % alphabet.len() as u64) as usize],
+                    7 => { s.remove(i); }
+                    8 => s.insert(i, b'0' + (rnd() % 10) as u8),
+                    _ => s[i] = (rnd() % 256) as u8,
+                }
+            }
+            let a = parse_ts(&s, &mut dc);
+            let b = old_parse_ts(&s, &mut oc);
+            assert_eq!(a, b, "mismatch on {:?} (round {round})", String::from_utf8_lossy(&s));
+            n += 1;
+        }
+        assert!(n > 0);
+    }
 }
