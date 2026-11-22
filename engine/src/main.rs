@@ -2225,6 +2225,14 @@ fn person(
 #[inline]
 fn span_add(assisted: &mut [u64], sday: &[u16], c: usize, ndays: usize, a: u32, b: u32) {
     let (mut k, b) = (a as usize, b as usize);
+    if b - k <= 16 {
+        // short spans (the common case): linear
+        while k < b {
+            assisted[c * ndays + sday[k] as usize] += 1;
+            k += 1;
+        }
+        return;
+    }
     while k < b {
         let d = sday[k];
         let e = k + sday[k..b].partition_point(|&x| x <= d);
