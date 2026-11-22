@@ -163,9 +163,27 @@ fn key_at(f: &[u8], avail: usize) -> Key {
             let p = f.as_ptr();
             let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
             let w1 = unsafe { (p.add(8) as *const u64).read_unaligned() }.to_le();
-            let lo = w0 & mask_bytes(n);
-            let hi = if n > 8 { w1 & mask_bytes(n - 8) } else { 0 };
-            Key { lo, hi: hi | ((n as u64) << 56) }
+            // MASK16[n] keeps the first n bytes of the 16-byte window (branch-free)
+            const fn m(k: usize) -> u64 {
+                if k == 0 {
+                    0
+                } else if k >= 8 {
+                    u64::MAX
+                } else {
+                    u64::MAX >> (64 - 8 * k)
+                }
+            }
+            const MASK16: [(u64, u64); 16] = {
+                let mut t = [(0u64, 0u64); 16];
+                let mut i = 0;
+                while i < 16 {
+                    t[i] = (m(i), m(i.saturating_sub(8)));
+                    i += 1;
+                }
+                t
+            };
+            let (m0, m1) = MASK16[n];
+            Key { lo: w0 & m0, hi: (w1 & m1) | ((n as u64) << 56) }
         } else {
             let mut b = [0u8; 16];
             b[..n].copy_from_slice(f);
@@ -955,6 +973,12 @@ impl IdTable {
             off: self.w[b + 3].load(Ordering::Relaxed),
             len: ((self.w[b + 2].load(Ordering::Relaxed) >> 32) & 0x7FFF_FFFF) as u32,
         }
+    }
+    /// (key.hi, key.lo) of slot i (top byte of hi = length for exact keys, 0xFF for hashed)
+    #[inline]
+    fn key_words(&self, i: u32) -> (u64, u64) {
+        let b = 4 * i as usize;
+        (self.w[b].load(Ordering::Relaxed), self.w[b + 1].load(Ordering::Relaxed))
     }
     #[inline]
     fn used(&self, i: usize) -> bool {
@@ -1777,14 +1801,27 @@ fn main() {
             let raw = huge_slice::<u32>(cap);
             unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const AtomicU32, cap) }
         };
+        // byte-wise "x < y" for two interned ids: short ids (<= 15 bytes) compare their exact key
+        // bytes from the table slot (big-endian, then length); long (hashed) ids use the arena
+        let id_lt = |x: u32, y: u32| -> bool {
+            let (hx, lx) = tab.key_words(x);
+            let (hy, ly) = tab.key_words(y);
+            let (nx, ny) = (hx >> 56, hy >> 56);
+            if nx <= 15 && ny <= 15 {
+                let ax = (lx.swap_bytes(), (hx & 0x00FF_FFFF_FFFF_FFFF).swap_bytes(), nx);
+                let ay = (ly.swap_bytes(), (hy & 0x00FF_FFFF_FFFF_FFFF).swap_bytes(), ny);
+                ax < ay
+            } else {
+                sref(x) < sref(y)
+            }
+        };
         links.par_iter().for_each(|&(a, b)| {
             for x in [a, b] {
                 let r = root[x as usize] as usize;
-                let sx = sref(x);
                 let mut cur = name1[r].load(Ordering::Relaxed);
                 loop {
                     let cs = if cur == 0 { r as u32 } else { cur - 1 };
-                    if cs == x || sx >= sref(cs) {
+                    if cs == x || !id_lt(x, cs) {
                         break;
                     }
                     match name1[r].compare_exchange_weak(cur, x + 1, Ordering::Relaxed, Ordering::Relaxed) {
@@ -2830,6 +2867,43 @@ mod ingest_test {
                 b[i] = alpha[(rnd() % alpha.len() as u64) as usize];
             }
             assert_eq!(parse_ingest(&b, &mut dc), parse_ts(&b, &mut dc), "{}", String::from_utf8_lossy(&b));
+        }
+    }
+}
+
+#[cfg(test)]
+mod idcmp_test {
+    use super::*;
+    /// the names loop orders short ids by their key words; must equal byte-wise order
+    #[test]
+    fn key_order_matches_bytes() {
+        let lt = |a: Key, b: Key| {
+            let (nx, ny) = (a.hi >> 56, b.hi >> 56);
+            assert!(nx <= 15 && ny <= 15);
+            (a.lo.swap_bytes(), (a.hi & 0x00FF_FFFF_FFFF_FFFF).swap_bytes(), nx)
+                < (b.lo.swap_bytes(), (b.hi & 0x00FF_FFFF_FFFF_FFFF).swap_bytes(), ny)
+        };
+        let mut seed = 0x77u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alpha = [0u8, 1, b'0', b'9', b'A', b'Z', b'a', b'u', b'z', 0x7F, 0x80, 0xC3, 0xFF];
+        for _ in 0..2_000_000 {
+            let la = 1 + (rnd() % 15) as usize;
+            let a: Vec<u8> = (0..la).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect();
+            let b: Vec<u8> = if rnd() % 3 == 0 {
+                // prefix / extension cases
+                let mut b = a.clone();
+                if rnd() % 2 == 0 && b.len() > 1 { b.pop(); } else if b.len() < 15 { b.push(alpha[(rnd() % alpha.len() as u64) as usize]); }
+                b
+            } else {
+                let lb = 1 + (rnd() % 15) as usize;
+                (0..lb).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect()
+            };
+            assert_eq!(lt(key(&a), key(&b)), a < b, "{a:?} {b:?}");
         }
     }
 }
