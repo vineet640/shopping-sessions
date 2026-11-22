@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 arrow-array = "60.2.0"
 arrow-schema = "60.2.0"
+libc = "0.2.191"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 parquet = { version = "60.2.0", default-features = false, features = ["arrow"] }

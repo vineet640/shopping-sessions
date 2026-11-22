@@ -56,6 +56,28 @@ impl Bytes {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PopMode {
+    Map,   // MAP_POPULATE whole files at open (per-file, serial within a file)
+    Chunk, // MADV_POPULATE_READ per parse chunk (parallel)
+    None,  // plain page faults
+}
+fn popmode() -> PopMode {
+    static M: std::sync::OnceLock<PopMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("SS_POPMODE").as_deref() {
+        Ok("chunk") => PopMode::Chunk,
+        Ok("none") => PopMode::None,
+        Ok("map") => PopMode::Map,
+        _ => {
+            if std::env::var_os("SS_NOPOPULATE").is_some() {
+                PopMode::None
+            } else {
+                PopMode::Map
+            }
+        }
+    })
+}
+
 fn open(path: &Path) -> Bytes {
     let f = fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let len = f.metadata().unwrap().len();
@@ -64,7 +86,7 @@ fn open(path: &Path) -> Bytes {
     }
     let mut o = memmap2::MmapOptions::new();
     #[cfg(target_os = "linux")]
-    if std::env::var_os("SS_NOPOPULATE").is_none() {
+    if popmode() == PopMode::Map {
         o.populate();
     }
     let m = unsafe { o.map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
@@ -291,7 +313,7 @@ fn p8(b: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct DateCache {
     ybase: i64,
     days: Vec<i32>, // [(y - ybase) * 372 + (m - 1) * 31 + (d - 1)] = epoch day, or i32::MIN if impossible
@@ -628,12 +650,51 @@ const READY: u64 = 1 << 63;
 ///   2: READY | len << 32 | root        3: arena pointer (thread << 40 | offset)
 struct IdTable {
     mask: usize,
-    w: Vec<AtomicU64>,
+    w: BigBuf,
     limit: usize,
     count: AtomicUsize,
     overflow: AtomicBool,
 }
 
+/// Large zeroed array of atomics: 2 MB aligned, transparent huge pages requested (Linux),
+/// pre-faulted by all threads in parallel instead of by random first touches later.
+struct BigBuf {
+    ptr: *mut AtomicU64,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+unsafe impl Send for BigBuf {}
+unsafe impl Sync for BigBuf {}
+impl std::ops::Deref for BigBuf {
+    type Target = [AtomicU64];
+    fn deref(&self) -> &[AtomicU64] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl Drop for BigBuf {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, self.layout) }
+    }
+}
+fn big_zeroed(n: usize) -> BigBuf {
+    const HP: usize = 2 << 20;
+    let bytes = (n * 8).div_ceil(HP) * HP;
+    let layout = std::alloc::Layout::from_size_align(bytes, HP).unwrap();
+    let p = unsafe { std::alloc::alloc(layout) };
+    assert!(!p.is_null(), "alloc");
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::madvise(p as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+    }
+    struct P(*mut u8);
+    unsafe impl Sync for P {}
+    let pp = P(p);
+    let pp = &pp;
+    (0..bytes / HP).into_par_iter().for_each(|k| unsafe { std::ptr::write_bytes(pp.0.add(k * HP), 0, HP) });
+    BigBuf { ptr: p as *mut AtomicU64, len: n, layout }
+}
+
+#[allow(dead_code)]
 fn zeroed_atomics(n: usize) -> Vec<AtomicU64> {
     let mut v = std::mem::ManuallyDrop::new(vec![0u64; n]);
     unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU64, v.len(), v.capacity()) }
@@ -643,7 +704,7 @@ impl IdTable {
     fn new(cap: usize) -> Self {
         IdTable {
             mask: cap - 1,
-            w: zeroed_atomics(4 * cap),
+            w: big_zeroed(4 * cap),
             limit: cap / 10 * 7,
             count: AtomicUsize::new(0),
             overflow: AtomicBool::new(false),
@@ -802,6 +863,14 @@ fn pbucket(r: u32, pshift: u32) -> usize {
 
 fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let base = cx.files.b[c.fi].get();
+    #[cfg(target_os = "linux")]
+    if popmode() == PopMode::Chunk {
+        if let Bytes::Map(m) = &cx.files.b[c.fi] {
+            let a = c.s & !4095;
+            let e = (c.e + 4096).min(m.len());
+            let _ = m.advise_range(memmap2::Advice::PopulateRead, a, e - a);
+        }
+    }
     let (rs, re) = chunk_region(base, c);
     if re <= rs {
         return;
@@ -874,6 +943,24 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
             }
         }
         Kind::Ck => {
+            // same software pipeline as events: prefetch the user's id slot, insert one row later
+            let mut pending: Option<(Key, &[u8], u64, u16, &[u8])> = None;
+            macro_rules! finish_ck {
+                ($pp:expr) => {{
+                    let (uk, us, tsr, camp, id): (Key, &[u8], u64, u16, &[u8]) = $pp;
+                    let root = cx.tab.insert(uk, us, arena, w, newids).1;
+                    let (b0, b1) = be16(id);
+                    let o = id.as_ptr() as usize - base.as_ptr() as usize;
+                    ckb[pbucket(root, cx.pshift)].push(PCk {
+                        key: ((root as u64) << cx.tbits) | tsr,
+                        b0,
+                        b1,
+                        len: id.len() as u32,
+                        camp,
+                        id: SPtr { off: ((c.fi as u64) << 40) | o as u64, len: id.len() as u32 },
+                    });
+                }};
+            }
             nlines[1] += for_lines::<4, _>(data, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -886,18 +973,16 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     Some(c) => c,
                     None => return,
                 };
-                let root = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).1;
-                let (b0, b1) = be16(f[0]);
-                let o = f[0].as_ptr() as usize - base.as_ptr() as usize;
-                ckb[pbucket(root, cx.pshift)].push(PCk {
-                    key: ((root as u64) << cx.tbits) | (ts - cx.cws) as u64,
-                    b0,
-                    b1,
-                    len: f[0].len() as u32,
-                    camp,
-                    id: SPtr { off: ((c.fi as u64) << 40) | o as u64, len: f[0].len() as u32 },
-                });
+                let uk = key_at(f[1], avail(f[1]));
+                cx.tab.prefetch(uk);
+                if let Some(pp) = pending.take() {
+                    finish_ck!(pp);
+                }
+                pending = Some((uk, f[1], (ts - cx.cws) as u64, camp, f[0]));
             });
+            if let Some(pp) = pending.take() {
+                finish_ck!(pp);
+            }
         }
         Kind::Ln => {
             nlines[2] += for_lines::<2, _>(data, |f| {
@@ -1195,22 +1280,23 @@ fn main() {
     let per_pb = ev_bytes / 70 / nworkers / NPB * 5 / 4 + 16;
     let per_pbc = ck_bytes / 45 / nworkers / NPB * 5 / 4 + 16;
 
+    let dc0 = DateCache::new(ws);
     let mut cap = (total / 600).next_power_of_two().max(1 << 16);
     let (tab, mut outs, root, name1) = loop {
         let pbits = 64 - (cap as u64).leading_zeros();
         assert!(tbits + pbits <= 64, "key packing");
         let tab = IdTable::new(cap);
-        let outs: Vec<Mutex<ParseOut>> = (0..nworkers + 1)
-            .map(|_| {
-                Mutex::new(ParseOut {
-                    evb: (0..NDB).map(|_| Vec::with_capacity(per_db)).collect(),
-                    pev: (0..NPB).map(|_| Vec::with_capacity(per_pb)).collect(),
-                    ckb: (0..NPB).map(|_| Vec::with_capacity(per_pbc)).collect(),
-                    dc: DateCache::new(ws),
-                    ..Default::default()
-                })
-            })
-            .collect();
+        // per-thread buffers are allocated lazily by their own thread (parallel, no serial
+        // allocation storm in the main thread)
+        let outs: Vec<Mutex<ParseOut>> = (0..nworkers + 1).map(|_| Mutex::new(ParseOut::default())).collect();
+        let ensure = |o: &mut ParseOut| {
+            if o.evb.is_empty() {
+                o.evb = (0..NDB).map(|_| Vec::with_capacity(per_db)).collect();
+                o.pev = (0..NPB).map(|_| Vec::with_capacity(per_pb)).collect();
+                o.ckb = (0..NPB).map(|_| Vec::with_capacity(per_pbc)).collect();
+                o.dc = dc0.clone();
+            }
+        };
         let cx = Ctx {
             files: &files,
             tab: &tab,
@@ -1226,7 +1312,9 @@ fn main() {
         // ---- A: links
         link_chunks.par_iter().for_each(|c| {
             let w = rayon::current_thread_index().unwrap_or(nworkers);
-            parse_chunk(&cx, c, w, &mut outs[w].lock().unwrap());
+            let mut g = outs[w].lock().unwrap();
+            ensure(&mut g);
+            parse_chunk(&cx, c, w, &mut g);
         });
         if tab.overflow.load(Ordering::Relaxed) {
             cap *= 4;
@@ -1235,32 +1323,37 @@ fn main() {
         }
         let links: Vec<(u32, u32)> =
             outs.iter().flat_map(|o| std::mem::take(&mut o.lock().unwrap().links)).collect();
-        let mut parent: Vec<u32> = (0..cap as u32).collect();
-        fn find(p: &mut [u32], mut x: u32) -> u32 {
-            while p[x as usize] != x {
-                let g = p[p[x as usize] as usize];
-                p[x as usize] = g;
+        // concurrent union-find: link the larger root under the smaller with CAS, path halving.
+        // Invariant parent[x] <= x, so every walk terminates and the root is the smallest slot.
+        let parent: Vec<AtomicU32> = (0..cap as u32).into_par_iter().map(AtomicU32::new).collect();
+        let find = |mut x: u32| -> u32 {
+            loop {
+                let p = parent[x as usize].load(Ordering::Relaxed);
+                if p == x {
+                    return x;
+                }
+                let g = parent[p as usize].load(Ordering::Relaxed);
+                if g != p {
+                    // path halving (benign race: g <= p, any stale value still respects the invariant)
+                    let _ = parent[x as usize].compare_exchange_weak(p, g, Ordering::Relaxed, Ordering::Relaxed);
+                }
                 x = g;
             }
-            x
-        }
-        for &(a, b) in &links {
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
+        };
+        links.par_iter().for_each(|&(a, b)| {
+            let (mut ra, mut rb) = (find(a), find(b));
+            while ra != rb {
+                let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                match parent[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break,
+                    Err(_) => {
+                        ra = find(lo);
+                        rb = find(hi);
+                    }
                 }
             }
-        }
-        // parent[i] <= i always, so one ascending pass makes every entry its root
-        for i in 0..cap {
-            let p = parent[i];
-            parent[i] = parent[p as usize];
-        }
-        let root = parent;
+        });
+        let root: Vec<u32> = (0..cap as u32).into_par_iter().map(|i| find(i)).collect();
         root.par_iter().enumerate().for_each(|(i, &r)| {
             if r as usize != i {
                 tab.set_root(i, r);
@@ -1300,8 +1393,19 @@ fn main() {
         // ---- B: events + clicks
         main_chunks.par_iter().for_each(|c| {
             let w = rayon::current_thread_index().unwrap_or(nworkers);
-            parse_chunk(&cx, c, w, &mut outs[w].lock().unwrap());
+            let mut g = outs[w].lock().unwrap();
+            ensure(&mut g);
+            parse_chunk(&cx, c, w, &mut g);
         });
+        // threads that parsed nothing still need (empty) buckets for the later phases
+        for o in &outs {
+            let mut g = o.lock().unwrap();
+            if g.evb.is_empty() {
+                g.evb = (0..NDB).map(|_| Vec::new()).collect();
+                g.pev = (0..NPB).map(|_| Vec::new()).collect();
+                g.ckb = (0..NPB).map(|_| Vec::new()).collect();
+            }
+        }
         let newids: usize = outs.iter().map(|o| o.lock().unwrap().newids).sum();
         if tab.overflow.load(Ordering::Relaxed) || newids > tab.limit {
             cap *= 4;
