@@ -1550,7 +1550,13 @@ fn main() {
         let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize][b][(s & ((1 << 27) - 1)) as usize] };
         let mut dups = 0usize;
         for (t, part) in evbs.iter().enumerate() {
-            for (k, e) in part[b].iter().enumerate() {
+            let part = &part[b];
+            for (k, e) in part.iter().enumerate() {
+                if let Some(f) = part.get(k + 8) {
+                    // prefetch the table slot of a record 8 ahead (table can exceed L2)
+                    let mf = mix(Key { lo: f.klo, hi: f.khi });
+                    prefetch_ptr(tab.as_ptr().wrapping_add(mf as usize & mask) as *const i8);
+                }
                 let m = mix(Key { lo: e.klo, hi: e.khi });
                 let tag = ((m >> 32) | 1) & 0xFFFF_FFFF;
                 let me = (tag << 32) | ((t as u64) << 27) | k as u64;
