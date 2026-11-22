@@ -385,6 +385,50 @@ fn pairs8(x: u64) -> u64 {
     (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF
 }
 
+/// ingest_ts: rules.md guarantees it is always a valid F1 ("YYYY-MM-DDTHH:MM:SSZ"), so the
+/// common case skips digit/range validation. Anything that does not look like F1 (or a year outside
+/// the day table) takes the fully validating parser.
+#[inline]
+fn parse_ingest(f: &[u8], dc: &mut DateCache) -> Option<i64> {
+    if f.len() == 20 && f[19] == b'Z' && !dc.days.is_empty() {
+        let p = f.as_ptr();
+        let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+        let w1 = unsafe { (p.add(8) as *const u64).read_unaligned() }.to_le();
+        let w2 = unsafe { (p.add(16) as *const u32).read_unaligned() }.to_le() as u64;
+        let da = (w0 & 0xFFFF_FFFF) | (((w0 >> 40) & 0xFFFF) << 32) | ((w1 & 0xFFFF) << 48);
+        let ta = ((w1 >> 24) & 0xFFFF) | (((w1 >> 48) & 0xFFFF) << 16) | (((w2 >> 8) & 0xFFFF) << 32) | (0x3030u64 << 48);
+        // same validation as parse_ts (separators by masked compare, SWAR digits, ranges below)
+        let seps_ok = (w0 & 0xFF00_00FF_0000_0000) == 0x2D00_002D_0000_0000
+            && (w1 & 0x0000_FF00_00FF_0000) == 0x0000_3A00_0054_0000
+            && (w2 & 0xFF) == 0x3A;
+        let pd = pairs8(da);
+        let pt = pairs8(ta);
+        let y = ((pd & 0xFF) * 100 + ((pd >> 16) & 0xFF)) as i64;
+        let mo = ((pd >> 32) & 0xFF) as i64;
+        let d = ((pd >> 48) & 0xFF) as i64;
+        let yi = y - dc.ybase;
+        if seps_ok
+            && digits8(da)
+            && digits8(ta)
+            && (0..DC_YEARS).contains(&yi)
+            && (1..=12).contains(&mo)
+            && (1..=31).contains(&d)
+            && (pt & 0xFF) <= 23
+            && ((pt >> 16) & 0xFF) <= 59
+            && ((pt >> 32) & 0xFF) <= 59
+        {
+            let v = unsafe { *dc.days.get_unchecked((yi * 372 + (mo - 1) * 31 + (d - 1)) as usize) };
+            if v != i32::MIN {
+                let h = (pt & 0xFF) as i64;
+                let mi = ((pt >> 16) & 0xFF) as i64;
+                let sec = ((pt >> 32) & 0xFF) as i64;
+                return Some(v as i64 * DAY + h * 3_600_000 + mi * 60_000 + sec * 1000);
+            }
+        }
+    }
+    parse_ts(f, dc)
+}
+
 /// F1 / F2 / F3 -> epoch ms. None = bad timestamp (F3 beyond i64 included).
 #[inline]
 fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
@@ -1175,7 +1219,7 @@ fn parse_chunk_inner(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     return;
                 }
                 let k = key_at(f[0], avail(f[0]));
-                let ing = parse_ts(f[3], dc).unwrap_or(i64::MAX);
+                let ing = parse_ingest(f[3], dc).unwrap_or(i64::MAX);
                 let mut ok = !f[1].is_empty() && !f[5].is_empty();
                 let mut ts = 0i64;
                 if ok {
@@ -2733,5 +2777,53 @@ mod tok_bench {
             (5 * body.len()) as f64 / el.as_secs_f64() / 1e9,
             lines / 5
         );
+    }
+}
+
+#[cfg(test)]
+mod ingest_test {
+    use super::*;
+    /// parse_ingest must equal parse_ts on every valid F1 string (and fall back otherwise)
+    #[test]
+    fn ingest_matches_full_parser_on_f1() {
+        let ws = parse_ts(b"2027-12-15T00:00:00Z", &mut DateCache::default()).unwrap();
+        let mut dc = DateCache::new(ws);
+        let mut seed = 0x51u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2_000_000 {
+            let ms = 1_600_000_000_000i64 + (rnd() % 600_000_000_000) as i64;
+            let s = ms.div_euclid(1000);
+            let days = s.div_euclid(86_400);
+            // civil from days
+            let z = days + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+            let r = s.rem_euclid(86_400);
+            let txt = format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", r / 3600, r / 60 % 60, r % 60);
+            assert_eq!(parse_ingest(txt.as_bytes(), &mut dc), parse_ts(txt.as_bytes(), &mut dc), "{txt}");
+        }
+        for t in ["2028-02-30T00:00:00Z", "1791071890000", "2027-12-15T10:00:00+05:00", "", "2027-12-15 10:00:00Z"] {
+            assert_eq!(parse_ingest(t.as_bytes(), &mut dc), parse_ts(t.as_bytes(), &mut dc), "{t}");
+        }
+        let alpha = b"0123456789-T:Z +ztx";
+        for _ in 0..2_000_000 {
+            let mut b = b"2027-12-15T10:20:30Z".to_vec();
+            for _ in 0..(rnd() % 3 + 1) {
+                let i = (rnd() % 20) as usize;
+                b[i] = alpha[(rnd() % alpha.len() as u64) as usize];
+            }
+            assert_eq!(parse_ingest(&b, &mut dc), parse_ts(&b, &mut dc), "{}", String::from_utf8_lossy(&b));
+        }
     }
 }
