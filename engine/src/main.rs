@@ -1756,13 +1756,20 @@ fn main() {
         let mut dups = 0usize;
         for (t, part) in evbs.iter().enumerate() {
             let part = part.slice(b);
+            // hashes of the next 8 records: computed once, used for the prefetch then the probe
+            let mut hr = [0u64; 8];
+            for (k, f) in part.iter().take(8).enumerate() {
+                hr[k] = mix(Key { lo: f.klo, hi: f.khi });
+                prefetch_ptr(tab.as_ptr().wrapping_add(hr[k] as usize & mask) as *const i8);
+            }
             for (k, e) in part.iter().enumerate() {
+                let m = hr[k & 7];
                 if let Some(f) = part.get(k + 8) {
                     // prefetch the table slot of a record 8 ahead (table can exceed L2)
                     let mf = mix(Key { lo: f.klo, hi: f.khi });
+                    hr[k & 7] = mf;
                     prefetch_ptr(tab.as_ptr().wrapping_add(mf as usize & mask) as *const i8);
                 }
-                let m = mix(Key { lo: e.klo, hi: e.khi });
                 let tag = ((m >> 32) | 1) & 0xFFFF_FFFF;
                 let me = (tag << 32) | ((t as u64) << 27) | k as u64;
                 let mut i = m as usize & mask;
