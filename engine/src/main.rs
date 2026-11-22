@@ -489,10 +489,14 @@ fn parse_price(f: &[u8]) -> Option<u32> {
 /// fields, stripped) of `data` (lines separated by '\n'; `data` has no trailing '\n').
 #[inline]
 fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f: F) -> u64 {
+    // Structural iteration over ',' and '\n' only; quotes are counted per line with popcount and
+    // validated at the end of the line: a line is well-formed iff every field that starts with '"'
+    // is >= 2 bytes and ends with '"', and the line holds exactly 2 quotes per such field (so no
+    // quote appears anywhere else).
     let mut bounds = [(0usize, 0usize); N];
     let mut nf = 0usize;
     let mut fstart = 0usize;
-    let mut qmask = 0u32;
+    let mut lq = 0u32; // quotes seen in the current line
     let mut lines = 0u64;
     macro_rules! finish {
         ($end:expr) => {{
@@ -501,27 +505,35 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
             if nf + 1 == N {
                 bounds[nf] = (fstart, end);
                 let mut fs: [&'a [u8]; N] = [&[]; N];
-                let mut ok = true;
-                for k in 0..N {
-                    let (s, e) = bounds[k];
-                    let v = &data[s..e];
-                    if qmask & (1 << k) != 0 {
-                        let l = v.len();
-                        if l < 2 || v[0] != b'"' || v[l - 1] != b'"' || memchr::memchr(b'"', &v[1..l - 1]).is_some() {
-                            ok = false;
-                            break;
-                        }
-                        fs[k] = &v[1..l - 1];
-                    } else {
-                        fs[k] = v;
+                if lq == 0 {
+                    for k in 0..N {
+                        fs[k] = &data[bounds[k].0..bounds[k].1];
                     }
-                }
-                if ok {
                     f(&fs);
+                } else {
+                    let mut ok = true;
+                    let mut qf = 0u32;
+                    for k in 0..N {
+                        let v = &data[bounds[k].0..bounds[k].1];
+                        if !v.is_empty() && v[0] == b'"' {
+                            let l = v.len();
+                            if l < 2 || v[l - 1] != b'"' {
+                                ok = false;
+                                break;
+                            }
+                            qf += 1;
+                            fs[k] = &v[1..l - 1];
+                        } else {
+                            fs[k] = v;
+                        }
+                    }
+                    if ok && qf * 2 == lq {
+                        f(&fs);
+                    }
                 }
             }
             nf = 0;
-            qmask = 0;
+            lq = 0;
             fstart = end + 1;
         }};
     }
@@ -529,30 +541,34 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
     let mut blk = 0usize;
     let mut tail = [0u8; 64];
     while blk < n {
-        let mut mask = if blk + 64 <= n {
-            delim_mask(&data[blk..blk + 64])
+        let (sm, nlm, qm) = if blk + 64 <= n {
+            delim_masks(&data[blk..blk + 64])
         } else {
             tail = [0u8; 64];
             tail[..n - blk].copy_from_slice(&data[blk..]);
-            delim_mask(&tail)
+            delim_masks(&tail)
         };
-        while mask != 0 {
-            let p = blk + mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            match data[p] {
-                b',' => {
-                    if nf < N {
-                        bounds[nf] = (fstart, p);
-                    }
-                    nf += 1;
-                    fstart = p + 1;
+        let mut s = sm;
+        let mut qrem = qm;
+        while s != 0 {
+            let i = s.trailing_zeros();
+            s &= s - 1;
+            let p = blk + i as usize;
+            if (nlm >> i) & 1 == 0 {
+                if nf < N {
+                    bounds[nf] = (fstart, p);
                 }
-                b'"' => {
-                    qmask |= 1u32 << nf.min(31);
-                }
-                _ => finish!(p),
+                nf += 1;
+                fstart = p + 1;
+            } else {
+                // quotes of this line that sit in this block (earlier blocks already counted)
+                let below = (1u64 << i) - 1;
+                lq += (qrem & below).count_ones();
+                qrem &= !below;
+                finish!(p);
             }
         }
+        lq += qrem.count_ones();
         blk += 64;
     }
     let _ = &tail;
@@ -562,6 +578,67 @@ fn for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f
     lines
 }
 
+/// (',' | '\n', '\n', '"') position masks of a 64-byte block (bit i = byte i).
+#[inline(always)]
+fn delim_masks(b: &[u8]) -> (u64, u64, u64) {
+    debug_assert!(b.len() >= 64);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm_set1_epi8(b',' as i8);
+        let q = _mm_set1_epi8(b'"' as i8);
+        let nl = _mm_set1_epi8(b'\n' as i8);
+        let (mut ms, mut mn, mut mq) = (0u64, 0u64, 0u64);
+        for k in 0..4 {
+            let v = _mm_loadu_si128(b.as_ptr().add(16 * k) as *const __m128i);
+            let en = _mm_cmpeq_epi8(v, nl);
+            let es = _mm_or_si128(_mm_cmpeq_epi8(v, c), en);
+            ms |= (_mm_movemask_epi8(es) as u32 as u64) << (16 * k);
+            mn |= (_mm_movemask_epi8(en) as u32 as u64) << (16 * k);
+            mq |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u32 as u64) << (16 * k);
+        }
+        (ms, mn, mq)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let w = vld1q_u8(W.as_ptr());
+        let p = b.as_ptr();
+        let v = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
+        let red = |e: [uint8x16_t; 4]| -> u64 {
+            let s0 = vpaddq_u8(vandq_u8(e[0], w), vandq_u8(e[1], w));
+            let s1 = vpaddq_u8(vandq_u8(e[2], w), vandq_u8(e[3], w));
+            let s = vpaddq_u8(s0, s1);
+            let s = vpaddq_u8(s, s);
+            vgetq_lane_u64(vreinterpretq_u64_u8(s), 0)
+        };
+        let c = vdupq_n_u8(b',');
+        let q = vdupq_n_u8(b'"');
+        let nl = vdupq_n_u8(b'\n');
+        let en = [vceqq_u8(v[0], nl), vceqq_u8(v[1], nl), vceqq_u8(v[2], nl), vceqq_u8(v[3], nl)];
+        let es = [
+            vorrq_u8(vceqq_u8(v[0], c), en[0]),
+            vorrq_u8(vceqq_u8(v[1], c), en[1]),
+            vorrq_u8(vceqq_u8(v[2], c), en[2]),
+            vorrq_u8(vceqq_u8(v[3], c), en[3]),
+        ];
+        let eq = [vceqq_u8(v[0], q), vceqq_u8(v[1], q), vceqq_u8(v[2], q), vceqq_u8(v[3], q)];
+        (red(es), red(en), red(eq))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let (mut ms, mut mn, mut mq) = (0u64, 0u64, 0u64);
+        for (i, &x) in b[..64].iter().enumerate() {
+            ms |= ((x == b',' || x == b'\n') as u64) << i;
+            mn |= ((x == b'\n') as u64) << i;
+            mq |= ((x == b'"') as u64) << i;
+        }
+        (ms, mn, mq)
+    }
+}
+
+#[allow(dead_code)] // used by the tokenizer fuzz test (previous tokenizer)
 /// Bitmask of the positions of ',', '"' and '\n' in a 64-byte block (bit i = byte i).
 #[inline(always)]
 fn delim_mask(b: &[u8]) -> u64 {
@@ -985,16 +1062,34 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
             }
         }
         Kind::Ln => {
+            // pipelined: prefetch both slots, insert one line later
+            let mut pending: Option<(Key, &[u8], Key, &[u8])> = None;
+            macro_rules! finish_ln {
+                ($pp:expr) => {{
+                    let (ka, sa, kb, sb): (Key, &[u8], Key, &[u8]) = $pp;
+                    let a = cx.tab.insert(ka, sa, arena, w, newids).0;
+                    let b = cx.tab.insert(kb, sb, arena, w, newids).0;
+                    if a != b {
+                        links.push((a, b));
+                    }
+                }};
+            }
             nlines[2] += for_lines::<2, _>(data, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let a = cx.tab.insert(key_at(f[0], avail(f[0])), f[0], arena, w, newids).0;
-                let b = cx.tab.insert(key_at(f[1], avail(f[1])), f[1], arena, w, newids).0;
-                if a != b {
-                    links.push((a, b));
+                let ka = key_at(f[0], avail(f[0]));
+                let kb = key_at(f[1], avail(f[1]));
+                cx.tab.prefetch(ka);
+                cx.tab.prefetch(kb);
+                if let Some(pp) = pending.take() {
+                    finish_ln!(pp);
                 }
+                pending = Some((ka, f[0], kb, f[1]));
             });
+            if let Some(pp) = pending.take() {
+                finish_ln!(pp);
+            }
         }
     }
 }
@@ -1455,7 +1550,13 @@ fn main() {
         let get = |s: u64| -> &Ev { &evbs[((s >> 27) & 31) as usize][b][(s & ((1 << 27) - 1)) as usize] };
         let mut dups = 0usize;
         for (t, part) in evbs.iter().enumerate() {
-            for (k, e) in part[b].iter().enumerate() {
+            let part = &part[b];
+            for (k, e) in part.iter().enumerate() {
+                if let Some(f) = part.get(k + 8) {
+                    // prefetch the table slot of a record 8 ahead (table can exceed L2)
+                    let mf = mix(Key { lo: f.klo, hi: f.khi });
+                    prefetch_ptr(tab.as_ptr().wrapping_add(mf as usize & mask) as *const i8);
+                }
                 let m = mix(Key { lo: e.klo, hi: e.khi });
                 let tag = ((m >> 32) | 1) & 0xFFFF_FFFF;
                 let me = (tag << 32) | ((t as u64) << 27) | k as u64;
@@ -1525,28 +1626,71 @@ fn main() {
             let wk = &mut *wk;
             let mut ev = std::mem::take(&mut wk.ev_buf);
             let mut ck = std::mem::take(&mut wk.ck_buf);
+            // radix by person only (few varying bits), then sort each person's (small) run by time
             let esrc: Vec<&[PEv]> = routed.iter().map(|t| &t[b][..]).collect();
-            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits, |e| e.key);
+            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits - tbits, |e| e.key >> tbits);
+            let mut q = 0;
+            while q < ev.len() {
+                let p = ev[q].key >> tbits;
+                let mut r = q + 1;
+                while r < ev.len() && (ev[r].key >> tbits) == p {
+                    r += 1;
+                }
+                if r - q > 2048 {
+                    // whale person: radix on the time bits
+                    let run: Vec<PEv> = ev[q..r].to_vec();
+                    let mut out = Vec::new();
+                    let mut tmp = Vec::new();
+                    let mut h = Vec::new();
+                    radix_gather(&[&run[..]], |_| true, &mut out, &mut tmp, &mut h, tbits, |e| e.key & tmask);
+                    ev[q..r].copy_from_slice(&out);
+                } else if r - q > 1 {
+                    ev[q..r].sort_unstable_by_key(|e| e.key);
+                }
+                q = r;
+            }
             let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| &t[b][..]).collect();
-            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits, |c| c.key);
-            // equal keys (same person, same ms): order by click_id bytes
-            let cmp_id = |x: &PCk, y: &PCk| {
-                (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
-                    if x.len <= 16 && y.len <= 16 {
-                        x.len.cmp(&y.len)
-                    } else {
-                        files_r.s(x.id).cmp(files_r.s(y.id))
-                    }
+            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits - tbits, |c| c.key >> tbits);
+            // per person: by time, ties (same ms) by click_id bytes
+            let cmp = |x: &PCk, y: &PCk| {
+                x.key.cmp(&y.key).then_with(|| {
+                    (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
+                        if x.len <= 16 && y.len <= 16 {
+                            x.len.cmp(&y.len)
+                        } else {
+                            files_r.s(x.id).cmp(files_r.s(y.id))
+                        }
+                    })
                 })
             };
             let mut q = 0;
             while q < ck.len() {
+                let p = ck[q].key >> tbits;
                 let mut r = q + 1;
-                while r < ck.len() && ck[r].key == ck[q].key {
+                while r < ck.len() && (ck[r].key >> tbits) == p {
                     r += 1;
                 }
-                if r - q > 1 {
-                    ck[q..r].sort_unstable_by(cmp_id);
+                if r - q > 2048 {
+                    // big run: radix on time, then fix ties (same ms) by click_id
+                    let run: Vec<PCk> = ck[q..r].to_vec();
+                    let mut out = Vec::new();
+                    let mut tmp = Vec::new();
+                    let mut h = Vec::new();
+                    radix_gather(&[&run[..]], |_| true, &mut out, &mut tmp, &mut h, tbits, |c| c.key & tmask);
+                    let mut a = 0;
+                    while a < out.len() {
+                        let mut z = a + 1;
+                        while z < out.len() && out[z].key == out[a].key {
+                            z += 1;
+                        }
+                        if z - a > 1 {
+                            out[a..z].sort_unstable_by(cmp);
+                        }
+                        a = z;
+                    }
+                    ck[q..r].copy_from_slice(&out);
+                } else if r - q > 1 {
+                    ck[q..r].sort_unstable_by(cmp);
                 }
                 q = r;
             }
@@ -2048,5 +2192,113 @@ mod ts_fuzz {
             n += 1;
         }
         assert!(n > 0);
+    }
+}
+
+
+#[cfg(test)]
+mod tok_fuzz {
+    use super::*;
+    fn old_for_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f: F) -> u64 {
+        let mut bounds = [(0usize, 0usize); N];
+        let mut nf = 0usize;
+        let mut fstart = 0usize;
+        let mut qmask = 0u32;
+        let mut lines = 0u64;
+        macro_rules! finish {
+            ($end:expr) => {{
+                let end = $end;
+                lines += 1;
+                if nf + 1 == N {
+                    bounds[nf] = (fstart, end);
+                    let mut fs: [&'a [u8]; N] = [&[]; N];
+                    let mut ok = true;
+                    for k in 0..N {
+                        let (s, e) = bounds[k];
+                        let v = &data[s..e];
+                        if qmask & (1 << k) != 0 {
+                            let l = v.len();
+                            if l < 2 || v[0] != b'"' || v[l - 1] != b'"' || memchr::memchr(b'"', &v[1..l - 1]).is_some() {
+                                ok = false;
+                                break;
+                            }
+                            fs[k] = &v[1..l - 1];
+                        } else {
+                            fs[k] = v;
+                        }
+                    }
+                    if ok {
+                        f(&fs);
+                    }
+                }
+                nf = 0;
+                qmask = 0;
+                fstart = end + 1;
+            }};
+        }
+        let n = data.len();
+        let mut blk = 0usize;
+        let mut tail = [0u8; 64];
+        while blk < n {
+            let mut mask = if blk + 64 <= n {
+                delim_mask(&data[blk..blk + 64])
+            } else {
+                tail = [0u8; 64];
+                tail[..n - blk].copy_from_slice(&data[blk..]);
+                delim_mask(&tail)
+            };
+            while mask != 0 {
+                let p = blk + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                match data[p] {
+                    b',' => {
+                        if nf < N {
+                            bounds[nf] = (fstart, p);
+                        }
+                        nf += 1;
+                        fstart = p + 1;
+                    }
+                    b'"' => {
+                        qmask |= 1u32 << nf.min(31);
+                    }
+                    _ => finish!(p),
+                }
+            }
+            blk += 64;
+        }
+        let _ = &tail;
+        if fstart < data.len() || (fstart == data.len() && nf > 0) {
+            finish!(data.len());
+        }
+        lines
+    }
+
+
+    fn collect<const N: usize>(d: &[u8], new: bool) -> (Vec<Vec<Vec<u8>>>, u64) {
+        let mut v = Vec::new();
+        let n = if new {
+            for_lines::<N, _>(d, |f| v.push(f.iter().map(|x| x.to_vec()).collect()))
+        } else {
+            old_for_lines::<N, _>(d, |f| v.push(f.iter().map(|x| x.to_vec()).collect()))
+        };
+        (v, n)
+    }
+    #[test]
+    fn new_matches_old() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alpha = b"aab,,,\"\"\n\r x";
+        for round in 0..300_000u64 {
+            let len = (rnd() % 300) as usize;
+            let d: Vec<u8> = (0..len).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect();
+            assert_eq!(collect::<2>(&d, true), collect::<2>(&d, false), "N=2 round {round}: {:?}", String::from_utf8_lossy(&d));
+            assert_eq!(collect::<4>(&d, true), collect::<4>(&d, false), "N=4 round {round}");
+            assert_eq!(collect::<7>(&d, true), collect::<7>(&d, false), "N=7 round {round}");
+        }
     }
 }

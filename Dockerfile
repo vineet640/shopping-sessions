@@ -2,6 +2,7 @@
 FROM --platform=linux/amd64 rust:1-bookworm AS build
 WORKDIR /src
 COPY engine/Cargo.toml engine/Cargo.lock ./
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
 RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release --locked && rm -rf src target/release/deps/ss-* target/release/ss* target/release/.fingerprint/ss-*
 COPY engine/src ./src
 RUN touch src/main.rs && cargo build --release --locked && strip target/release/ss && test $(stat -c %s target/release/ss) -gt 1000000
