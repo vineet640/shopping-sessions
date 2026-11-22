@@ -195,6 +195,11 @@ impl SmallMap {
         }
         m
     }
+    #[inline(always)]
+    fn prefetch(&self, k: Key) {
+        let i = mix(k) as usize & self.mask;
+        prefetch_ptr(self.keys.as_ptr().wrapping_add(i) as *const i8);
+    }
     #[inline]
     fn get(&self, k: Key) -> Option<u16> {
         let mut i = mix(k) as usize & self.mask;
@@ -208,6 +213,18 @@ impl SmallMap {
             }
             i = (i + 1) & self.mask;
         }
+    }
+}
+
+#[inline(always)]
+fn prefetch_ptr(p: *const i8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
     }
 }
 
@@ -636,15 +653,7 @@ impl IdTable {
     #[inline(always)]
     fn prefetch(&self, k: Key) {
         let i = mix(k) as usize & self.mask;
-        let p = self.w.as_ptr().wrapping_add(4 * i) as *const i8;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-        }
+        prefetch_ptr(self.w.as_ptr().wrapping_add(4 * i) as *const i8);
     }
     /// -> (slot, root)
     #[inline]
@@ -803,11 +812,12 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut pending: Option<(Key, i64, u64, u32, u16, Key, &[u8])> = None;
+            let mut pending: Option<(Key, i64, u64, u32, Key, Key, &[u8])> = None;
             let tbits = cx.tbits;
             macro_rules! finish_ev {
                 ($pp:expr) => {{
-                    let (k, ing, tsr, price, cat, uk, us): (Key, i64, u64, u32, u16, Key, &[u8]) = $pp;
+                    let (k, ing, tsr, price, pk, uk, us): (Key, i64, u64, u32, Key, Key, &[u8]) = $pp;
+                    let cat = cx.products.get(pk).unwrap_or(cx.unknown_cat);
                     let root = cx.tab.insert(uk, us, arena, w, newids).1;
                     let pb = pbucket(root, cx.pshift);
                     let v = &mut pev[pb];
@@ -849,11 +859,12 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     // software pipeline: prefetch this row's id slot, finish the previous row's insert
                     let uk = key_at(f[1], avail(f[1]));
                     cx.tab.prefetch(uk);
-                    let cat = cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat);
+                    let pk = key_at(f[5], avail(f[5]));
+                    cx.products.prefetch(pk);
                     if let Some(pp) = pending.take() {
                         finish_ev!(pp);
                     }
-                    pending = Some((k, ing, (ts - cx.cws) as u64, price, cat, uk, f[1]));
+                    pending = Some((k, ing, (ts - cx.cws) as u64, price, pk, uk, f[1]));
                 } else {
                     evb[(mix(k) >> (64 - DB_BITS)) as usize].push(Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 }
