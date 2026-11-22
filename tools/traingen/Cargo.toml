@@ -1,0 +1,9 @@
+[package]
+name = "traingen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Our own synthetic Shopping Sessions-like data, used only as PGO training input at image build time."
+
+[profile.release]
+opt-level = 2
