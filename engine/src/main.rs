@@ -31,6 +31,7 @@ const PB_BITS: u32 = 9; // person buckets
 const NPB: usize = 1 << PB_BITS;
 const NO_CAT: u16 = u16::MAX;
 const CH: usize = 1 << 20; // parse chunk bytes
+const PF: usize = 8; // rows in flight between id-slot prefetch and insert (hides DRAM latency)
 
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 macro_rules! log {
@@ -69,11 +70,8 @@ fn popmode() -> PopMode {
         Ok("none") => PopMode::None,
         Ok("map") => PopMode::Map,
         _ => {
-            if std::env::var_os("SS_NOPOPULATE").is_some() {
-                PopMode::None
-            } else {
-                PopMode::Map
-            }
+            // measured on the scorer: populating buys nothing (none 1.69 s vs map 1.72 s at 20M)
+            PopMode::None
         }
     })
 }
@@ -974,7 +972,8 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut pending: Option<(Key, i64, u64, u32, Key, Key, &[u8])> = None;
+            let mut ring: [Option<(Key, i64, u64, u32, Key, Key, &[u8])>; PF] = [None; PF];
+            let mut rpos = 0usize;
             let tbits = cx.tbits;
             macro_rules! finish_ev {
                 ($pp:expr) => {{
@@ -1023,21 +1022,26 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     cx.tab.prefetch(uk);
                     let pk = key_at(f[5], avail(f[5]));
                     cx.products.prefetch(pk);
-                    if let Some(pp) = pending.take() {
+                    let slot = rpos % PF;
+                    rpos += 1;
+                    if let Some(pp) = ring[slot].take() {
                         finish_ev!(pp);
                     }
-                    pending = Some((k, ing, (ts - cx.cws) as u64, price, pk, uk, f[1]));
+                    ring[slot] = Some((k, ing, (ts - cx.cws) as u64, price, pk, uk, f[1]));
                 } else {
                     evb[(mix(k) >> (64 - DB_BITS)) as usize].push(Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 }
             });
-            if let Some(pp) = pending.take() {
-                finish_ev!(pp);
+            for i in 0..PF {
+                if let Some(pp) = ring[(rpos + i) % PF].take() {
+                    finish_ev!(pp);
+                }
             }
         }
         Kind::Ck => {
             // same software pipeline as events: prefetch the user's id slot, insert one row later
-            let mut pending: Option<(Key, &[u8], u64, u16, &[u8])> = None;
+            let mut ring: [Option<(Key, &[u8], u64, u16, &[u8])>; PF] = [None; PF];
+            let mut rpos = 0usize;
             macro_rules! finish_ck {
                 ($pp:expr) => {{
                     let (uk, us, tsr, camp, id): (Key, &[u8], u64, u16, &[u8]) = $pp;
@@ -1067,18 +1071,23 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 };
                 let uk = key_at(f[1], avail(f[1]));
                 cx.tab.prefetch(uk);
-                if let Some(pp) = pending.take() {
+                let slot = rpos % PF;
+                rpos += 1;
+                if let Some(pp) = ring[slot].take() {
                     finish_ck!(pp);
                 }
-                pending = Some((uk, f[1], (ts - cx.cws) as u64, camp, f[0]));
+                ring[slot] = Some((uk, f[1], (ts - cx.cws) as u64, camp, f[0]));
             });
-            if let Some(pp) = pending.take() {
-                finish_ck!(pp);
+            for i in 0..PF {
+                if let Some(pp) = ring[(rpos + i) % PF].take() {
+                    finish_ck!(pp);
+                }
             }
         }
         Kind::Ln => {
             // pipelined: prefetch both slots, insert one line later
-            let mut pending: Option<(Key, &[u8], Key, &[u8])> = None;
+            let mut ring: [Option<(Key, &[u8], Key, &[u8])>; PF] = [None; PF];
+            let mut rpos = 0usize;
             macro_rules! finish_ln {
                 ($pp:expr) => {{
                     let (ka, sa, kb, sb): (Key, &[u8], Key, &[u8]) = $pp;
@@ -1097,13 +1106,17 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 let kb = key_at(f[1], avail(f[1]));
                 cx.tab.prefetch(ka);
                 cx.tab.prefetch(kb);
-                if let Some(pp) = pending.take() {
+                let slot = rpos % PF;
+                rpos += 1;
+                if let Some(pp) = ring[slot].take() {
                     finish_ln!(pp);
                 }
-                pending = Some((ka, f[0], kb, f[1]));
+                ring[slot] = Some((ka, f[0], kb, f[1]));
             });
-            if let Some(pp) = pending.take() {
-                finish_ln!(pp);
+            for i in 0..PF {
+                if let Some(pp) = ring[(rpos + i) % PF].take() {
+                    finish_ln!(pp);
+                }
             }
         }
     }

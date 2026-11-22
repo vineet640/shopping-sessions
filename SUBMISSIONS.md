@@ -9,4 +9,4 @@
 | Sat 18:04 | bf89737 | v2 + parallel chunk snapping, id prefetch, span assists | BB-90F25A87: scored 2.1974 s (no gain vs 2.1757; chunk-scan fix did not matter on scorer) |
 | Sat 18:34 | 5c695dd (diag branch) | DIAGNOSTIC: scorer facts + 20M stage timings, fails dev on purpose | BB-5C8ADE62: rejected on purpose; logs: /data=tmpfs (cat 92MB 17ms), dev wall 137ms vs internal 124ms, links stage 43ms on dev (~0.25s at 20M?) |
 | Sat 19:04 | 7e932df | fused dedup, radix_gather, SWAR ts, concurrent UF, THP table, branch-light tokenizer, x86-64-v2, person sort | BB-7548E45A: SCORED 1.8910 s (best) |
-| Sat 19:34 | 983bc4f (diag) | DIAGNOSTIC v2: CPU flags, THP, 20M stage timings x7 variants | BB-BA6F4D24 queued |
+| Sat 19:34 | 983bc4f (diag) | DIAGNOSTIC v2: CPU flags, THP, 20M stage timings x7 variants | BB-BA6F4D24: rejected on purpose. Xeon 2.8GHz AVX2+BMI2+AVX512, THP=madvise, L3 33MB. 20M wall 1.70s: links .14, parse ~1.0, dedup .07, sessions .29, write .02; populate none 1.69 vs map 1.72 vs chunk 1.76; NCPU16 1.80, NCPU4 2.14 |
