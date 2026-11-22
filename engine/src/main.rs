@@ -857,6 +857,8 @@ struct Worker {
     ck_buf: Vec<PCk>,
     ev_tmp: Vec<PEv>,
     ck_tmp: Vec<PCk>,
+    since: Vec<u32>,
+    sday: Vec<u16>,
 }
 
 /// LSD radix sort by the low `bits` bits of key(x), 11-bit digits; skips constant digits.
@@ -1268,6 +1270,8 @@ fn main() {
                 ck_buf: vec![],
                 ev_tmp: vec![],
                 ck_tmp: vec![],
+                since: vec![0; ncamp],
+                sday: vec![],
             })
         })
         .collect();
@@ -1396,6 +1400,8 @@ fn person(
     let mut i = 0usize;
     let mut jhi = 0usize;
     let mut jlo = 0usize;
+    let mut si: u32 = 0; // session index within this person
+    wk.sday.clear();
     // current user_daily accumulation
     let mut cur_day = i64::MIN;
     let mut ud = UdRow { name, day: 0, sessions: 0, events: 0, revenue: 0, top: NO_CAT };
@@ -1467,11 +1473,15 @@ fn person(
         ud.events += cnt;
         ud.revenue += revenue;
         // clicks: add ts <= start, remove ts < start - WEEK
+        // A campaign assists every session started while it has >= 1 click in [start-7d, start].
+        // Track activity spans [since, now) over session indices and add them per day when the
+        // span closes (O(clicks x days) instead of O(sessions x active campaigns)).
         while jhi < m && t(ck[jhi].key) <= start {
             let c = ck[jhi].camp as usize;
             if wk.cnt[c] == 0 {
                 wk.pos[c] = wk.active.len() as u32;
                 wk.active.push(c as u16);
+                wk.since[c] = si;
             }
             wk.cnt[c] += 1;
             jhi += 1;
@@ -1485,6 +1495,7 @@ fn person(
                 wk.active[p] = last;
                 wk.pos[last as usize] = p as u32;
                 wk.active.pop();
+                span_add(&mut wk.acc.assisted, &wk.sday, c, ndays, wk.since[c], si);
             }
             jlo += 1;
         }
@@ -1505,17 +1516,30 @@ fn person(
         if has_p {
             wk.acc.purch[ix] += 1;
         }
-        for &c in &wk.active {
-            wk.acc.assisted[c as usize * ndays + d] += 1;
-        }
+        wk.sday.push(d as u16);
+        si += 1;
         i = k;
     }
     flush(&mut ud, &mut wk.purch, rows);
-    // reset active set
-    for &c in &wk.active {
-        wk.cnt[c as usize] = 0;
+    // close the still-open spans and reset the active set
+    for idx in 0..wk.active.len() {
+        let c = wk.active[idx] as usize;
+        span_add(&mut wk.acc.assisted, &wk.sday, c, ndays, wk.since[c], si);
+        wk.cnt[c] = 0;
     }
     wk.active.clear();
+}
+
+/// assisted[c][day(s)] += 1 for every session index s in [a, b) (session days are nondecreasing).
+#[inline]
+fn span_add(assisted: &mut [u64], sday: &[u16], c: usize, ndays: usize, a: u32, b: u32) {
+    let (mut k, b) = (a as usize, b as usize);
+    while k < b {
+        let d = sday[k];
+        let e = k + sday[k..b].partition_point(|&x| x <= d);
+        assisted[c * ndays + d as usize] += (e - k) as u64;
+        k = e;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
