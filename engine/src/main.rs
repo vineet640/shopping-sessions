@@ -893,11 +893,10 @@ struct PEv {
 #[derive(Clone, Copy)]
 struct PCk {
     key: u64,
-    b0: u64, // click_id bytes 0..8, big-endian, zero padded
-    b1: u64, // bytes 8..16
+    b0: u64,  // click_id bytes 0..8, big-endian, zero padded (fast tie order)
+    off: u64, // click_id location: file << 40 | offset (exact tie order)
     len: u32,
     camp: u16,
-    id: SPtr,
 }
 
 #[inline]
@@ -1043,15 +1042,14 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 ($pp:expr) => {{
                     let (uk, us, tsr, camp, id): (Key, &[u8], u64, u16, &[u8]) = $pp;
                     let root = cx.tab.insert(uk, us, arena, w, newids).1;
-                    let (b0, b1) = be16(id);
+                    let (b0, _) = be16(id);
                     let o = id.as_ptr() as usize - base.as_ptr() as usize;
                     ckb[pbucket(root, cx.pshift)].push(PCk {
                         key: ((root as u64) << cx.tbits) | tsr,
                         b0,
-                        b1,
+                        off: ((c.fi as u64) << 40) | o as u64,
                         len: id.len() as u32,
                         camp,
-                        id: SPtr { off: ((c.fi as u64) << 40) | o as u64, len: id.len() as u32 },
                     });
                 }};
             }
@@ -1680,11 +1678,13 @@ fn main() {
             // per person: by time, ties (same ms) by click_id bytes
             let cmp = |x: &PCk, y: &PCk| {
                 x.key.cmp(&y.key).then_with(|| {
-                    (x.b0, x.b1).cmp(&(y.b0, y.b1)).then_with(|| {
-                        if x.len <= 16 && y.len <= 16 {
+                    x.b0.cmp(&y.b0).then_with(|| {
+                        if x.len <= 8 && y.len <= 8 {
                             x.len.cmp(&y.len)
                         } else {
-                            files_r.s(x.id).cmp(files_r.s(y.id))
+                            files_r
+                                .s(SPtr { off: x.off, len: x.len })
+                                .cmp(files_r.s(SPtr { off: y.off, len: y.len }))
                         }
                     })
                 })
