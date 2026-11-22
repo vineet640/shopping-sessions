@@ -1311,8 +1311,11 @@ fn radix_gather<T: Copy, P: Fn(&T) -> bool, K: Fn(&T) -> u64>(
     bits: u32,
     key: K,
 ) {
-    const D: u32 = 12;
-    const R: usize = 1 << D;
+    // one pass when the key has <= 16 bits, else 12-bit digits
+    let dd: u32 = if bits <= 16 { bits.max(1) } else { 12 };
+    let rr: usize = 1 << dd;
+    #[allow(non_snake_case)]
+    let (D, R) = (dd, rr);
     let nd = bits.div_ceil(D).max(1) as usize;
     hist.clear();
     hist.resize(nd * R, 0);
@@ -1808,7 +1811,9 @@ fn main() {
         })
         .collect();
     let tmask = (1u64 << tbits) - 1;
-    let kbits = tbits + (64 - (cap as u64).leading_zeros());
+    let _kbits = tbits + (64 - (cap as u64).leading_zeros());
+    let pshift_s = cap.trailing_zeros().saturating_sub(PB_BITS);
+    let pmask: u64 = (1u64 << pshift_s) - 1;
     let files_r = &files;
     let tab_r = &tab;
     let name_r = &name1;
@@ -1840,7 +1845,8 @@ fn main() {
             let t0 = if st { Some(Instant::now()) } else { None };
             // radix by person only (few varying bits), then sort each person's (small) run by time
             let esrc: Vec<&[PEv]> = routed.iter().map(|t| t.slice(b)).collect();
-            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, kbits - tbits, |e| e.key >> tbits);
+            // within a bucket only the low `pshift` bits of the person root vary
+            radix_gather(&esrc, |e| !e.dead, &mut ev, &mut wk.ev_tmp, &mut wk.hist, pshift_s, |e| (e.key >> tbits) & pmask);
             let mut q = 0;
             while q < ev.len() {
                 let p = ev[q].key >> tbits;
@@ -1863,7 +1869,7 @@ fn main() {
             }
             let t1 = if st { Some(Instant::now()) } else { None };
             let csrc: Vec<&[PCk]> = ckbs.iter().map(|t| t.slice(b)).collect();
-            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, kbits - tbits, |c| c.key >> tbits);
+            radix_gather(&csrc, |_| true, &mut ck, &mut wk.ck_tmp, &mut wk.hist, pshift_s, |c| (c.key >> tbits) & pmask);
             // per person: by time, ties (same ms) by click_id bytes
             let cmp = |x: &PCk, y: &PCk| {
                 x.key.cmp(&y.key).then_with(|| {
