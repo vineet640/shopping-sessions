@@ -1131,6 +1131,7 @@ struct Worker {
     since: Vec<u32>,
     sday: Vec<u16>,
     hist: Vec<u32>,
+    udw: Option<PqWriter>,
 }
 
 /// Gathers the rows of `srcs` that pass `keep` into `out`, sorted by key (LSD radix, 12-bit
@@ -1514,6 +1515,9 @@ fn main() {
     let nl: [u64; 3] = outs.iter().fold([0; 3], |a, o| [a[0] + o.nlines[0], a[1] + o.nlines[1], a[2] + o.nlines[2]]);
     let nids: usize = outs.iter().map(|o| o.newids).sum();
     log!("parsed: {} event lines, {} click lines, {} link lines; {} ids (cap {})", nl[0], nl[1], nl[2], nids, cap);
+    if std::env::var_os("SS_STOP_AFTER_PARSE").is_some() {
+        std::process::exit(0); // profiling aid
+    }
     let arenas = Arenas { a: outs.iter_mut().map(|o| std::mem::take(&mut o.arena)).collect() };
 
     // ---- C: dedup. One pass per event-id bucket with an L2-sized table; when two copies of an
@@ -1609,6 +1613,7 @@ fn main() {
                 since: vec![0; ncamp],
                 sday: vec![],
                 hist: vec![],
+                udw: None,
             })
         })
         .collect();
@@ -1618,7 +1623,11 @@ fn main() {
     let tab_r = &tab;
     let name_r = &name1;
     let cat_rank_r = &cat_rank;
-    let ud_parts: Vec<Vec<UdRow>> = (0..NPB)
+    let ud_dir = out.join("user_daily");
+    fs::create_dir_all(&ud_dir).unwrap();
+    let arenas_r = &arenas;
+    let catnames_r = &catnames;
+    let ud_parts: Vec<usize> = (0..NPB)
         .into_par_iter()
         .map(|b| {
             let w = rayon::current_thread_index().unwrap_or(nworkers);
@@ -1730,13 +1739,25 @@ fn main() {
             }
             wk.ev_buf = ev;
             wk.ck_buf = ck;
-            rows
+            if !rows.is_empty() {
+                let pw = wk.udw.get_or_insert_with(|| ud_writer(&ud_dir, w));
+                ud_write(pw, &rows, arenas_r, catnames_r);
+            }
+            rows.len()
         })
         .collect();
     std::mem::forget(routed);
     std::mem::forget(ckbs);
-    let nud: usize = ud_parts.iter().map(|r| r.len()).sum();
+    let nud: usize = ud_parts.iter().sum();
     log!("sessions done: {} user_daily rows", nud);
+    // close the per-worker user_daily files (in parallel); an empty table still gets one file
+    let mut writers: Vec<PqWriter> = workers.iter().filter_map(|w| w.lock().unwrap().udw.take()).collect();
+    if writers.is_empty() {
+        writers.push(ud_writer(&ud_dir, 0));
+    }
+    writers.into_par_iter().for_each(|w| {
+        w.close().unwrap();
+    });
 
     // ---- campaign_daily
     let mut acc = CampAcc::new(ncs);
@@ -1750,7 +1771,7 @@ fn main() {
         }
     }
 
-    write_outputs(&out, &arenas, ud_parts, &catnames, &acc, &camp_names, ndays, ws_day);
+    write_outputs(&out, &acc, &camp_names, ndays, ws_day);
     log!("done");
     std::process::exit(0);
 }
@@ -1917,11 +1938,71 @@ fn span_add(assisted: &mut [u64], sday: &[u16], c: usize, ndays: usize, a: u32, 
 }
 
 #[allow(clippy::too_many_arguments)]
+type PqWriter = parquet::arrow::ArrowWriter<std::io::BufWriter<fs::File>>;
+
+fn pq_props() -> parquet::file::properties::WriterProperties {
+    parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+        .set_max_row_group_row_count(Some(1 << 20))
+        .build()
+}
+
+fn ud_schema() -> Arc<arrow_schema::Schema> {
+    use arrow_schema::{DataType, Field, Schema};
+    Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("sessions", DataType::Int64, false),
+        Field::new("events", DataType::Int64, false),
+        Field::new("revenue_cents", DataType::Int64, false),
+        Field::new("top_category", DataType::Utf8, true),
+    ]))
+}
+
+fn ud_writer(dir: &Path, idx: usize) -> PqWriter {
+    let f = fs::File::create(dir.join(format!("part-{idx:05}.parquet"))).unwrap();
+    parquet::arrow::ArrowWriter::try_new(std::io::BufWriter::with_capacity(1 << 22, f), ud_schema(), Some(pq_props())).unwrap()
+}
+
+/// Encode a bucket's user_daily rows into the worker's open Parquet file.
+fn ud_write(w: &mut PqWriter, rows: &[UdRow], names: &Arenas, catnames: &[&[u8]]) {
+    use arrow_array::builder::{Date32Builder, Int64Builder, StringBuilder};
+    use arrow_array::{ArrayRef, RecordBatch};
+    let n = rows.len();
+    let nb: usize = rows.iter().map(|r| r.name.len as usize).sum();
+    let mut uid = StringBuilder::with_capacity(n, nb);
+    let mut day = Date32Builder::with_capacity(n);
+    let mut ses = Int64Builder::with_capacity(n);
+    let mut evs = Int64Builder::with_capacity(n);
+    let mut rev = Int64Builder::with_capacity(n);
+    let mut top = StringBuilder::with_capacity(n, n * 8);
+    for r in rows {
+        uid.append_value(unsafe { std::str::from_utf8_unchecked(names.s(r.name)) });
+        day.append_value(r.day);
+        ses.append_value(r.sessions as i64);
+        evs.append_value(r.events as i64);
+        rev.append_value(r.revenue);
+        if r.top == NO_CAT {
+            top.append_null();
+        } else {
+            top.append_value(unsafe { std::str::from_utf8_unchecked(catnames[r.top as usize]) });
+        }
+    }
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(uid.finish()),
+        Arc::new(day.finish()),
+        Arc::new(ses.finish()),
+        Arc::new(evs.finish()),
+        Arc::new(rev.finish()),
+        Arc::new(top.finish()),
+    ];
+    w.write(&RecordBatch::try_new(ud_schema(), cols).unwrap()).unwrap();
+}
+
 fn write_outputs(
     out: &Path,
-    files: &Arenas,
-    ud_parts: Vec<Vec<UdRow>>,
-    catnames: &[&[u8]],
     acc: &CampAcc,
     camp_names: &[(&[u8], &[u8])],
     ndays: usize,
@@ -1946,59 +2027,6 @@ fn write_outputs(
     let cd_dir = out.join("campaign_daily");
     fs::create_dir_all(&ud_dir).unwrap();
     fs::create_dir_all(&cd_dir).unwrap();
-
-    let ud_schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
-    // group buckets into ~nthreads files
-    let nfiles = rayon::current_num_threads().max(1);
-    let per = ud_parts.len().div_ceil(nfiles);
-    let groups: Vec<&[Vec<UdRow>]> = ud_parts.chunks(per.max(1)).collect();
-    groups.par_iter().enumerate().for_each(|(gi, g)| {
-        let n: usize = g.iter().map(|r| r.len()).sum();
-        let nb: usize = g.iter().flat_map(|r| r.iter()).map(|r| r.name.len as usize).sum();
-        let mut uid = StringBuilder::with_capacity(n, nb);
-        let mut day = Date32Builder::with_capacity(n);
-        let mut ses = Int64Builder::with_capacity(n);
-        let mut evs = Int64Builder::with_capacity(n);
-        let mut rev = Int64Builder::with_capacity(n);
-        let mut top = StringBuilder::with_capacity(n, n * 8);
-        for r in g.iter().flat_map(|r| r.iter()) {
-            uid.append_value(unsafe { std::str::from_utf8_unchecked(files.s(r.name)) });
-            day.append_value(r.day);
-            ses.append_value(r.sessions as i64);
-            evs.append_value(r.events as i64);
-            rev.append_value(r.revenue);
-            if r.top == NO_CAT {
-                top.append_null();
-            } else {
-                top.append_value(unsafe { std::str::from_utf8_unchecked(catnames[r.top as usize]) });
-            }
-        }
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(uid.finish()),
-            Arc::new(day.finish()),
-            Arc::new(ses.finish()),
-            Arc::new(evs.finish()),
-            Arc::new(rev.finish()),
-            Arc::new(top.finish()),
-        ];
-        let batch = RecordBatch::try_new(ud_schema.clone(), cols).unwrap();
-        let f = fs::File::create(ud_dir.join(format!("part-{gi:05}.parquet"))).unwrap();
-        let mut w = ArrowWriter::try_new(std::io::BufWriter::with_capacity(1 << 22, f), ud_schema.clone(), Some(props())).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-    });
-    if groups.is_empty() {
-        let f = fs::File::create(ud_dir.join("part-00000.parquet")).unwrap();
-        let w = ArrowWriter::try_new(f, ud_schema.clone(), Some(props())).unwrap();
-        w.close().unwrap();
-    }
 
     let cd_schema = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
@@ -2300,5 +2328,35 @@ mod tok_fuzz {
             assert_eq!(collect::<4>(&d, true), collect::<4>(&d, false), "N=4 round {round}");
             assert_eq!(collect::<7>(&d, true), collect::<7>(&d, false), "N=7 round {round}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ts_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_parse_ts() {
+        let text = std::fs::read_to_string("../out/ts_sample.txt").unwrap();
+        let v: Vec<&[u8]> = text.lines().map(|l| l.as_bytes()).collect();
+        let ws = parse_ts(b"2027-12-01T00:00:00Z", &mut DateCache::default()).unwrap();
+        let mut dc = DateCache::new(ws);
+        let t = std::time::Instant::now();
+        let mut acc = 0i64;
+        for _ in 0..5 {
+            for s in &v {
+                acc = acc.wrapping_add(parse_ts(std::hint::black_box(s), &mut dc).unwrap_or(1));
+            }
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (5 * v.len()) as f64;
+        eprintln!("parse_ts: {ns:.1} ns/ts over {} samples (acc {acc})", v.len());
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            for s in &v {
+                acc = acc.wrapping_add(key(std::hint::black_box(s)).lo as i64);
+            }
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (5 * v.len()) as f64;
+        eprintln!("key(): {ns:.1} ns (acc {acc})");
     }
 }
