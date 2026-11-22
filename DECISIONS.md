@@ -41,3 +41,4 @@
 - 2026-11-21 21:21 CST: Product->category lookup only for purchases (category only feeds top_category, which counts purchases); views/carts only check product_id non-empty. -7% single-thread.
 - 2026-11-21 21:45 CST: Added a debug-build gate (overflow checks + debug_asserts): fixtures, dev, difftest 2k/20k pass. Event-callback instruction ablation (per event): key 41, two timestamps 278, type/price/late 30, dedup push 48, user key+prefetch 61, insert+pushes 152.
 - 2026-11-21 21:58 CST: Tried simdjson-style bit flattening in the tokenizer: slower (31 vs 28.6 ns/line), reverted.
+- 2026-11-21 22:00 CST: Diag v4: same-machine run-to-run spread ~10%; parse .78 s (events ~255 ns/line/thread), sessions .235 s (ev-sort .68, person .56, parquet .29, ck-sort .25 thread-s). Next: sessions ev-sort and person; event-parse instruction cuts. Use the A/B diag (v5) to judge changes below ~10%.
