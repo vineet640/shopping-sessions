@@ -465,9 +465,13 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
         // two overlapping 8-digit SWAR loads cover every digit (typical 13-digit epoch ms)
         const P10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
         let hi = p8(&r[..8])?;
-        let lo = p8(&r[m - 8..])?;
-        let k = m - 8;
-        hi * P10[k] + lo % P10[k]
+        // last 8 bytes, with the (16 - m) digits already counted in `hi` forced to '0' (no division)
+        let x = u64::from_le_bytes(r[m - 8..].try_into().unwrap());
+        let ov = 16 - m; // 0..=7 overlapping leading bytes (low bytes of the LE word)
+        let low_mask = if ov == 0 { 0 } else { u64::MAX >> (64 - 8 * ov) };
+        let x = (x & !low_mask) | (0x3030_3030_3030_3030 & low_mask);
+        let lo = p8(&x.to_le_bytes())?;
+        hi * P10[m - 8] + lo
     } else {
         let mut v: u64 = 0;
         let mut j = 0;
