@@ -245,13 +245,18 @@ impl SmallMap {
         m
     }
     #[inline(always)]
-    fn prefetch(&self, k: Key) {
+    fn prefetch(&self, k: Key) -> usize {
         let i = mix(k) as usize & self.mask;
         prefetch_ptr(self.e.as_ptr().wrapping_add(i) as *const i8);
+        i
     }
     #[inline]
     fn get(&self, k: Key) -> Option<u16> {
-        let mut i = mix(k) as usize & self.mask;
+        self.get_at(k, mix(k) as usize & self.mask)
+    }
+    #[inline]
+    fn get_at(&self, k: Key, i0: usize) -> Option<u16> {
+        let mut i = i0;
         loop {
             let s = &self.e[i];
             if s.k == k {
@@ -841,14 +846,20 @@ impl IdTable {
     }
     /// Prefetch the first probe slot of `k` (hides the cache miss of a later insert).
     #[inline(always)]
-    fn prefetch(&self, k: Key) {
+    fn prefetch(&self, k: Key) -> usize {
         let i = mix(k) as usize & self.mask;
         prefetch_ptr(self.w.as_ptr().wrapping_add(4 * i) as *const i8);
+        i
     }
     /// -> (slot, root)
     #[inline]
     fn insert(&self, k: Key, s: &[u8], arena: &mut Vec<u8>, w: usize, newc: &mut usize) -> (u32, u32) {
-        let mut i = mix(k) as usize & self.mask;
+        self.insert_at(k, mix(k) as usize & self.mask, s, arena, w, newc)
+    }
+    /// insert starting the probe at slot `i0` (= the value prefetch() returned for k)
+    #[inline]
+    fn insert_at(&self, k: Key, i0: usize, s: &[u8], arena: &mut Vec<u8>, w: usize, newc: &mut usize) -> (u32, u32) {
+        let mut i = i0;
         let mut probes = 0usize;
         loop {
             let b = 4 * i;
@@ -1099,14 +1110,14 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut ring: [Option<(Key, i64, u64, u32, Key, Key, &[u8])>; PF] = [None; PF];
+            let mut ring: [Option<(Key, i64, u64, u32, Key, usize, Key, usize, &[u8])>; PF] = [None; PF];
             let mut rpos = 0usize;
             let tbits = cx.tbits;
             macro_rules! finish_ev {
                 ($pp:expr) => {{
-                    let (k, ing, tsr, price, pk, uk, us): (Key, i64, u64, u32, Key, Key, &[u8]) = $pp;
-                    let cat = cx.products.get(pk).unwrap_or(cx.unknown_cat);
-                    let root = cx.tab.insert(uk, us, arena, w, newids).1;
+                    let (k, ing, tsr, price, pk, pi, uk, ui, us): (Key, i64, u64, u32, Key, usize, Key, usize, &[u8]) = $pp;
+                    let cat = cx.products.get_at(pk, pi).unwrap_or(cx.unknown_cat);
+                    let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
                     let pb = pbucket(root, cx.pshift);
                     let i = pev.push(pb, PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
                     let r = ((w as u64) << 56) | ((pb as u64) << 40) | i as u64;
@@ -1145,15 +1156,15 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 if ok {
                     // software pipeline: prefetch this row's id slot, finish the previous row's insert
                     let uk = key_at(f[1], avail(f[1]));
-                    cx.tab.prefetch(uk);
+                    let ui = cx.tab.prefetch(uk);
                     let pk = key_at(f[5], avail(f[5]));
-                    cx.products.prefetch(pk);
+                    let pi = cx.products.prefetch(pk);
                     let slot = rpos % PF;
                     rpos += 1;
                     if let Some(pp) = ring[slot].take() {
                         finish_ev!(pp);
                     }
-                    ring[slot] = Some((k, ing, (ts - cx.cws) as u64, price, pk, uk, f[1]));
+                    ring[slot] = Some((k, ing, (ts - cx.cws) as u64, price, pk, pi, uk, ui, f[1]));
                 } else {
                     evb.push((mix(k) >> (64 - DB_BITS)) as usize, Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 }
@@ -1166,12 +1177,12 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
         }
         Kind::Ck => {
             // same software pipeline as events: prefetch the user's id slot, insert one row later
-            let mut ring: [Option<(Key, &[u8], u64, u16, &[u8])>; PF] = [None; PF];
+            let mut ring: [Option<(Key, usize, &[u8], u64, u16, &[u8])>; PF] = [None; PF];
             let mut rpos = 0usize;
             macro_rules! finish_ck {
                 ($pp:expr) => {{
-                    let (uk, us, tsr, camp, id): (Key, &[u8], u64, u16, &[u8]) = $pp;
-                    let root = cx.tab.insert(uk, us, arena, w, newids).1;
+                    let (uk, ui, us, tsr, camp, id): (Key, usize, &[u8], u64, u16, &[u8]) = $pp;
+                    let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
                     let (b0, _) = be16(id);
                     let o = id.as_ptr() as usize - base.as_ptr() as usize;
                     ckb.push(pbucket(root, cx.pshift), PCk {
@@ -1196,13 +1207,13 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                     None => return,
                 };
                 let uk = key_at(f[1], avail(f[1]));
-                cx.tab.prefetch(uk);
+                let ui = cx.tab.prefetch(uk);
                 let slot = rpos % PF;
                 rpos += 1;
                 if let Some(pp) = ring[slot].take() {
                     finish_ck!(pp);
                 }
-                ring[slot] = Some((uk, f[1], (ts - cx.cws) as u64, camp, f[0]));
+                ring[slot] = Some((uk, ui, f[1], (ts - cx.cws) as u64, camp, f[0]));
             });
             for i in 0..PF {
                 if let Some(pp) = ring[(rpos + i) % PF].take() {
@@ -1212,13 +1223,13 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
         }
         Kind::Ln => {
             // pipelined: prefetch both slots, insert one line later
-            let mut ring: [Option<(Key, &[u8], Key, &[u8])>; PF] = [None; PF];
+            let mut ring: [Option<(Key, usize, &[u8], Key, usize, &[u8])>; PF] = [None; PF];
             let mut rpos = 0usize;
             macro_rules! finish_ln {
                 ($pp:expr) => {{
-                    let (ka, sa, kb, sb): (Key, &[u8], Key, &[u8]) = $pp;
-                    let a = cx.tab.insert(ka, sa, arena, w, newids).0;
-                    let b = cx.tab.insert(kb, sb, arena, w, newids).0;
+                    let (ka, ia, sa, kb, ib, sb): (Key, usize, &[u8], Key, usize, &[u8]) = $pp;
+                    let a = cx.tab.insert_at(ka, ia, sa, arena, w, newids).0;
+                    let b = cx.tab.insert_at(kb, ib, sb, arena, w, newids).0;
                     if a != b {
                         links.push((a, b));
                     }
@@ -1230,14 +1241,14 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 }
                 let ka = key_at(f[0], avail(f[0]));
                 let kb = key_at(f[1], avail(f[1]));
-                cx.tab.prefetch(ka);
-                cx.tab.prefetch(kb);
+                let ia = cx.tab.prefetch(ka);
+                let ib = cx.tab.prefetch(kb);
                 let slot = rpos % PF;
                 rpos += 1;
                 if let Some(pp) = ring[slot].take() {
                     finish_ln!(pp);
                 }
-                ring[slot] = Some((ka, f[0], kb, f[1]));
+                ring[slot] = Some((ka, ia, f[0], kb, ib, f[1]));
             });
             for i in 0..PF {
                 if let Some(pp) = ring[(rpos + i) % PF].take() {
