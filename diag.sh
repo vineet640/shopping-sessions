@@ -4,6 +4,7 @@
 exec 1>&2
 ns() { date +%s%N; }
 echo "CPU:$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2) | n=$(nproc) | THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled) | L3:$(grep -m1 'cache size' /proc/cpuinfo | cut -d: -f2)"
+echo "FLAGS: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx2|bmi1|bmi2|avx512f|avx512bw|avx512vl|popcnt|lzcnt|movbe|fma' | tr '\n' ' ')"
 t0=$(ns); /app/generate --seed 7 --events 20000000 --clicks 5000000 --output /scratch/g >/dev/null 2>&1; t1=$(ns); echo "gen20M $(( (t1-t0)/1000000 ))ms"
 run() {
   rm -rf /scratch/o; mkdir -p /scratch/o
