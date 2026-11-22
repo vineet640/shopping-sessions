@@ -155,7 +155,7 @@ fn mask_bytes(k: usize) -> u64 {
 }
 
 /// Key of a non-empty field `f`, where `avail` = bytes readable from f.as_ptr() (>= f.len()).
-#[inline]
+#[inline(always)]
 fn key_at(f: &[u8], avail: usize) -> Key {
     let n = f.len();
     if n <= 15 {
@@ -269,11 +269,11 @@ impl SmallMap {
         prefetch_ptr(self.e.as_ptr().wrapping_add(i) as *const i8);
         i
     }
-    #[inline]
+    #[inline(always)]
     fn get(&self, k: Key) -> Option<u16> {
         self.get_at(k, mix(k) as usize & self.mask)
     }
-    #[inline]
+    #[inline(always)]
     fn get_at(&self, k: Key, i0: usize) -> Option<u16> {
         let mut i = i0;
         loop {
@@ -303,7 +303,7 @@ fn prefetch_ptr(p: *const i8) {
 
 // ---------------------------------------------------------------- timestamps
 
-#[inline]
+#[inline(always)]
 fn d2(f: &[u8], i: usize) -> Option<i64> {
     let a = f[i].wrapping_sub(b'0');
     let b = f[i + 1].wrapping_sub(b'0');
@@ -407,7 +407,7 @@ fn pairs8(x: u64) -> u64 {
 /// ingest_ts: rules.md guarantees it is always a valid F1 ("YYYY-MM-DDTHH:MM:SSZ"), so the
 /// common case skips digit/range validation. Anything that does not look like F1 (or a year outside
 /// the day table) takes the fully validating parser.
-#[inline]
+#[inline(always)]
 fn parse_ingest(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     if f.len() == 20 && f[19] == b'Z' && !dc.days.is_empty() {
         let p = f.as_ptr();
@@ -449,7 +449,7 @@ fn parse_ingest(f: &[u8], dc: &mut DateCache) -> Option<i64> {
 }
 
 /// F1 / F2 / F3 -> epoch ms. None = bad timestamp (F3 beyond i64 included).
-#[inline]
+#[inline(always)]
 fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = f.len();
     if n == 0 {
@@ -564,7 +564,7 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
 }
 
 /// purchase price: digits only, 1..=10_000_000
-#[inline]
+#[inline(always)]
 fn parse_price(f: &[u8]) -> Option<u32> {
     if f.is_empty() {
         return None;
@@ -928,7 +928,7 @@ impl IdTable {
         self.insert_at(k, mix(k) as usize & self.mask, s, arena, w, newc)
     }
     /// insert starting the probe at slot `i0` (= the value prefetch() returned for k)
-    #[inline]
+    #[inline(always)]
     fn insert_at(&self, k: Key, i0: usize, s: &[u8], arena: &mut Vec<u8>, w: usize, newc: &mut usize) -> (u32, u32) {
         let mut i = i0;
         let mut probes = 0usize;
@@ -1023,7 +1023,7 @@ struct PCk {
 }
 
 /// first 8 bytes, big-endian, zero padded (lexicographic order of the prefix)
-#[inline]
+#[inline(always)]
 fn be8(s: &[u8]) -> u64 {
     if s.len() >= 8 {
         u64::from_be_bytes(s[..8].try_into().unwrap())
