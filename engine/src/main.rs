@@ -1278,6 +1278,26 @@ struct Worker {
     udw: Option<PqWriter>,
 }
 
+/// Vec with the given capacity whose buffer is advised for transparent huge pages (Linux).
+fn hp_vec<T>(cap: usize) -> Vec<T> {
+    let v: Vec<T> = Vec::with_capacity(cap);
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = cap * std::mem::size_of::<T>();
+        if bytes >= 4 << 20 {
+            // madvise needs a page-aligned range: round inwards
+            let start = (v.as_ptr() as usize + 4095) & !4095;
+            let end = (v.as_ptr() as usize + bytes) & !4095;
+            if end > start {
+                unsafe {
+                    libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+                }
+            }
+        }
+    }
+    v
+}
+
 /// Gathers the rows of `srcs` that pass `keep` into `out`, sorted by key (LSD radix, 12-bit
 /// digits, one histogram pass for all digits, constant digits skipped, the first scatter reads
 /// straight from the sources).
@@ -1777,12 +1797,23 @@ fn main() {
     fs::create_dir_all(&ud_dir).unwrap();
     let arenas_r = &arenas;
     let catnames_r = &catnames;
+    // per-worker sort buffers sized for the largest bucket, THP-advised (random radix scatter)
+    let maxe: usize = (0..NPB).map(|b| routed.iter().map(|t| t.slice(b).len()).sum::<usize>()).max().unwrap_or(0);
+    let maxc: usize = (0..NPB).map(|b| ckbs.iter().map(|t| t.slice(b).len()).sum::<usize>()).max().unwrap_or(0);
     let ud_parts: Vec<usize> = (0..NPB)
         .into_par_iter()
         .map(|b| {
             let w = rayon::current_thread_index().unwrap_or(nworkers);
             let mut wk = workers[w].lock().unwrap();
             let wk = &mut *wk;
+            if wk.ev_buf.capacity() < maxe {
+                wk.ev_buf = hp_vec(maxe);
+                wk.ev_tmp = hp_vec(maxe);
+            }
+            if wk.ck_buf.capacity() < maxc {
+                wk.ck_buf = hp_vec(maxc);
+                wk.ck_tmp = hp_vec(maxc);
+            }
             let mut ev = std::mem::take(&mut wk.ev_buf);
             let mut ck = std::mem::take(&mut wk.ck_buf);
             // radix by person only (few varying bits), then sort each person's (small) run by time
