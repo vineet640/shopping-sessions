@@ -40,3 +40,4 @@
 - 2026-11-21 21:22 CST: Leaderboard RESCORED (scorer v5): the 0.27-0.30 s cluster is gone; top is now ~0.60-0.70 s (Unlimited PTO 0.60). Ours 1.4165 s = #68/354. Diag v3 (PGO engine, 20M): wall 1.27 s = links .073 + parse .83 (68%) + dedup .055 + sessions .24 + write .024. Parse is the lever (~240 ns/line/thread on the scorer vs ~100 on M-series).
 - 2026-11-21 21:21 CST: Product->category lookup only for purchases (category only feeds top_category, which counts purchases); views/carts only check product_id non-empty. -7% single-thread.
 - 2026-11-21 21:45 CST: Added a debug-build gate (overflow checks + debug_asserts): fixtures, dev, difftest 2k/20k pass. Event-callback instruction ablation (per event): key 41, two timestamps 278, type/price/late 30, dedup push 48, user key+prefetch 61, insert+pushes 152.
+- 2026-11-21 21:58 CST: Tried simdjson-style bit flattening in the tokenizer: slower (31 vs 28.6 ns/line), reverted.
