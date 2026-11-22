@@ -17,3 +17,4 @@
 | Sat 21:24 | f9eff02 | + names batched, parquet batched, span fast path, category only for purchases | BB-0A2D8C48: SCORED 1.3173 s (best) |
 | Sat 21:36 | 9ef488b | + half-size event ring, division-free F3, unchecked ts loads | BB-EFA45B22: scored 1.4476 s (worse than 1.3173; scorer variance up to 20% -> A/B harness) |
 | Sat 21:48 | af3d7e5 (diag) | DIAGNOSTIC v4: per-kind parse stats | BB-F0CC7819: rejected on purpose. same-machine walls 1.39/1.26/1.23/1.24/1.36 s (+-10% noise); links .08, parse .78, dedup .056, sessions .235; parse thread-s events 5.5-6.4, clicks .95, links .15; sessions thread-s ev-sort .68, ck-sort .25, person .56, parquet .29 |
+| Sat 22:04 | d0faf23 (diag) | DIAGNOSTIC v5 A/B: f9eff02 vs HEAD 14655d0 (non-PGO, alternating x3, one machine) | BB-F4705702 queued |
