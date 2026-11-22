@@ -1958,14 +1958,32 @@ fn main() {
             }
             let t2 = if st { Some(Instant::now()) } else { None };
             let mut rows: Vec<UdRow> = Vec::new();
-            let mut i = 0usize;
-            let mut cj = 0usize;
-            while i < ev.len() {
-                let p = ev[i].key >> tbits;
-                let mut iend = i + 1;
-                while iend < ev.len() && (ev[iend].key >> tbits) == p {
-                    iend += 1;
+            // persons of this bucket, then their names resolved in tight independent loops
+            // (random reads into name1 / the id table overlap instead of serializing per person)
+            let mut pers: Vec<(u32, u32, u32)> = Vec::new();
+            {
+                let mut i = 0usize;
+                while i < ev.len() {
+                    let p = ev[i].key >> tbits;
+                    let mut iend = i + 1;
+                    while iend < ev.len() && (ev[iend].key >> tbits) == p {
+                        iend += 1;
+                    }
+                    pers.push((i as u32, iend as u32, p as u32));
+                    i = iend;
                 }
+            }
+            let nslots: Vec<u32> = pers
+                .iter()
+                .map(|&(_, _, p)| {
+                    let n1 = name_r[p as usize].load(Ordering::Relaxed);
+                    if n1 == 0 { p } else { n1 - 1 }
+                })
+                .collect();
+            let names: Vec<SPtr> = nslots.iter().map(|&ns| tab_r.sptr(ns)).collect();
+            let mut cj = 0usize;
+            for (pi, &(i, iend, p)) in pers.iter().enumerate() {
+                let (i, iend, p) = (i as usize, iend as usize, p as u64);
                 while cj < ck.len() && (ck[cj].key >> tbits) < p {
                     cj += 1;
                 }
@@ -1973,8 +1991,6 @@ fn main() {
                 while cend < ck.len() && (ck[cend].key >> tbits) == p {
                     cend += 1;
                 }
-                let n1 = name_r[p as usize].load(Ordering::Relaxed);
-                let nslot = if n1 == 0 { p as u32 } else { n1 - 1 };
                 person(
                     &ev[i..iend],
                     &ck[cj..cend],
@@ -1983,12 +1999,11 @@ fn main() {
                     ws_day,
                     ndays,
                     ncamp,
-                    tab_r.sptr(nslot),
+                    names[pi],
                     cat_rank_r,
                     wk,
                     &mut rows,
                 );
-                i = iend;
                 cj = cend;
             }
             let t3 = if st { Some(Instant::now()) } else { None };
