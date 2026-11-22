@@ -163,9 +163,27 @@ fn key_at(f: &[u8], avail: usize) -> Key {
             let p = f.as_ptr();
             let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
             let w1 = unsafe { (p.add(8) as *const u64).read_unaligned() }.to_le();
-            let lo = w0 & mask_bytes(n);
-            let hi = if n > 8 { w1 & mask_bytes(n - 8) } else { 0 };
-            Key { lo, hi: hi | ((n as u64) << 56) }
+            // MASK16[n] keeps the first n bytes of the 16-byte window (branch-free)
+            const fn m(k: usize) -> u64 {
+                if k == 0 {
+                    0
+                } else if k >= 8 {
+                    u64::MAX
+                } else {
+                    u64::MAX >> (64 - 8 * k)
+                }
+            }
+            const MASK16: [(u64, u64); 16] = {
+                let mut t = [(0u64, 0u64); 16];
+                let mut i = 0;
+                while i < 16 {
+                    t[i] = (m(i), m(i.saturating_sub(8)));
+                    i += 1;
+                }
+                t
+            };
+            let (m0, m1) = MASK16[n];
+            Key { lo: w0 & m0, hi: (w1 & m1) | ((n as u64) << 56) }
         } else {
             let mut b = [0u8; 16];
             b[..n].copy_from_slice(f);
