@@ -1251,14 +1251,12 @@ struct UdRow {
 
 struct CampAcc {
     // [(camp) * ndays + d] ; camp == ncamp is organic
-    sessions: Vec<u64>,
-    purch: Vec<u64>,
-    revenue: Vec<i64>,
+    cred: Vec<[i64; 3]>, // credited: sessions, purchasing sessions, revenue (one cache line touch)
     assisted: Vec<u64>,
 }
 impl CampAcc {
     fn new(n: usize) -> Self {
-        CampAcc { sessions: vec![0; n], purch: vec![0; n], revenue: vec![0; n], assisted: vec![0; n] }
+        CampAcc { cred: vec![[0; 3]; n], assisted: vec![0; n] }
     }
 }
 
@@ -1966,9 +1964,9 @@ fn main() {
     for w in workers {
         let w = w.into_inner().unwrap();
         for k in 0..ncs {
-            acc.sessions[k] += w.acc.sessions[k];
-            acc.purch[k] += w.acc.purch[k];
-            acc.revenue[k] += w.acc.revenue[k];
+            for j in 0..3 {
+                acc.cred[k][j] += w.acc.cred[k][j];
+            }
             acc.assisted[k] += w.acc.assisted[k];
         }
     }
@@ -2108,11 +2106,10 @@ fn person(
             ncamp
         };
         let ix = credit * ndays + d;
-        wk.acc.sessions[ix] += 1;
-        wk.acc.revenue[ix] += revenue;
-        if has_p {
-            wk.acc.purch[ix] += 1;
-        }
+        let cr = &mut wk.acc.cred[ix];
+        cr[0] += 1;
+        cr[1] += has_p as i64;
+        cr[2] += revenue;
         wk.sday.push(d as u16);
         si += 1;
         i = k;
@@ -2251,15 +2248,15 @@ fn write_outputs(
         let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { camp_names[c] };
         for d in 0..ndays {
             let k = c * ndays + d;
-            if acc.sessions[k] == 0 && acc.assisted[k] == 0 {
+            if acc.cred[k][0] == 0 && acc.assisted[k] == 0 {
                 continue;
             }
             cid.append_value(unsafe { std::str::from_utf8_unchecked(id) });
             chn.append_value(unsafe { std::str::from_utf8_unchecked(ch) });
             day.append_value((ws_day + d as i64) as i32);
-            ses.append_value(acc.sessions[k] as i64);
-            pur.append_value(acc.purch[k] as i64);
-            rev.append_value(acc.revenue[k]);
+            ses.append_value(acc.cred[k][0]);
+            pur.append_value(acc.cred[k][1]);
+            rev.append_value(acc.cred[k][2]);
             ast.append_value(acc.assisted[k] as i64);
         }
     }
