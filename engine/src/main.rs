@@ -945,7 +945,6 @@ struct PCk {
     camp: u16,
 }
 
-#[inline]
 /// first 8 bytes, big-endian, zero padded (lexicographic order of the prefix)
 #[inline]
 fn be8(s: &[u8]) -> u64 {
@@ -1028,6 +1027,14 @@ impl<T: Copy> Buckets<T> {
         let v = &mut self.spill[b];
         v.push(x);
         v.len() - 1
+    }
+    #[inline(always)]
+    fn at_mut(&mut self, b: usize, i: usize) -> &mut T {
+        if self.lens[b] == u32::MAX {
+            &mut self.spill[b][i]
+        } else {
+            unsafe { &mut *self.base.add(b * self.cap + i) }
+        }
     }
     #[inline]
     fn slice(&self, b: usize) -> &[T] {
@@ -1123,19 +1130,20 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
     let ParseOut { arena, evb, pev, ckb, links, nlines, newids, dc } = out;
     match c.kind {
         Kind::Ev => {
-            let mut ring: [Option<(Key, i64, u64, u32, Key, usize, Key, usize, &[u8])>; PF] = [None; PF];
+            // ring of rows waiting for their id-slot prefetch: (user key, slot, ts offset, price,
+            // category, dedup bucket, dedup row, user id bytes). The dedup record is written at
+            // once with r = NONE and patched when the row's person bucket position is known.
+            type Pend<'x> = (Key, u32, u32, u32, u16, u16, u32, &'x [u8]);
+            let mut ring: [Pend; PF] = [(Key::default(), 0, 0, 0, 0, 0, 0, &[]); PF];
             let mut rpos = 0usize;
             let tbits = cx.tbits;
             macro_rules! finish_ev {
                 ($pp:expr) => {{
-                    let (k, ing, tsr, price, pk, pi, uk, ui, us): (Key, i64, u64, u32, Key, usize, Key, usize, &[u8]) = $pp;
-                    // category only matters for purchases (top_category); views/carts skip the lookup
-                    let cat = if pi != usize::MAX { cx.products.get_at(pk, pi).unwrap_or(cx.unknown_cat) } else { 0 };
-                    let root = cx.tab.insert_at(uk, ui, us, arena, w, newids).1;
+                    let (uk, ui, tsr, price, cat, db, ei, us): Pend = $pp;
+                    let root = cx.tab.insert_at(uk, ui as usize, us, arena, w, newids).1;
                     let pb = pbucket(root, cx.pshift);
-                    let i = pev.push(pb, PEv { key: ((root as u64) << tbits) | tsr, price, cat, dead: false });
-                    let r = ((w as u64) << 56) | ((pb as u64) << 40) | i as u64;
-                    evb.push((mix(k) >> (64 - DB_BITS)) as usize, Ev { klo: k.lo, khi: k.hi, ing, r });
+                    let i = pev.push(pb, PEv { key: ((root as u64) << tbits) | tsr as u64, price, cat, dead: false });
+                    evb.at_mut(db as usize, ei as usize).r = ((w as u64) << 56) | ((pb as u64) << 40) | i as u64;
                 }};
             }
             nlines[0] += for_lines::<7, _>(data, |f| {
@@ -1167,30 +1175,28 @@ fn parse_chunk(cx: &Ctx, c: &Chunk, w: usize, out: &mut ParseOut) {
                 if ok && ing - ts > LATE {
                     ok = false;
                 }
+                let db = (mix(k) >> (64 - DB_BITS)) as usize;
+                let ei = evb.push(db, Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
                 if ok {
-                    // software pipeline: prefetch this row's id slot, finish the previous row's insert
+                    // software pipeline: prefetch this row's id slot, finish the row PF back
                     let uk = key_at(f[1], avail(f[1]));
                     let ui = cx.tab.prefetch(uk);
-                    let (pk, pi) = if price > 0 {
-                        let pk = key_at(f[5], avail(f[5]));
-                        (pk, cx.products.prefetch(pk))
+                    // category only matters for purchases (top_category); views/carts skip it
+                    let cat = if price > 0 {
+                        cx.products.get(key_at(f[5], avail(f[5]))).unwrap_or(cx.unknown_cat)
                     } else {
-                        (Key::default(), usize::MAX)
+                        0
                     };
-                    let slot = rpos % PF;
-                    rpos += 1;
-                    if let Some(pp) = ring[slot].take() {
-                        finish_ev!(pp);
+                    let slot = rpos & (PF - 1);
+                    if rpos >= PF {
+                        finish_ev!(ring[slot]);
                     }
-                    ring[slot] = Some((k, ing, (ts - cx.cws) as u64, price, pk, pi, uk, ui, f[1]));
-                } else {
-                    evb.push((mix(k) >> (64 - DB_BITS)) as usize, Ev { klo: k.lo, khi: k.hi, ing, r: NONE });
+                    ring[slot] = (uk, ui as u32, (ts - cx.cws) as u32, price, cat, db as u16, ei as u32, f[1]);
+                    rpos += 1;
                 }
             });
-            for i in 0..PF {
-                if let Some(pp) = ring[(rpos + i) % PF].take() {
-                    finish_ev!(pp);
-                }
+            for q in rpos.saturating_sub(PF)..rpos {
+                finish_ev!(ring[q & (PF - 1)]);
             }
         }
         Kind::Ck => {
