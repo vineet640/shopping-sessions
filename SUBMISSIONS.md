@@ -12,4 +12,4 @@
 | Sat 19:34 | 983bc4f (diag) | DIAGNOSTIC v2: CPU flags, THP, 20M stage timings x7 variants | BB-BA6F4D24: rejected on purpose. Xeon 2.8GHz AVX2+BMI2+AVX512, THP=madvise, L3 33MB. 20M wall 1.70s: links .14, parse ~1.0, dedup .07, sessions .29, write .02; populate none 1.69 vs map 1.72 vs chunk 1.76; NCPU16 1.80, NCPU4 2.14 |
 | Sat 20:04 | 7de0291 (=1c9d642 code) | bucket slabs (THP) + prefetch ring + v3 + 32B clicks + streaming parquet | BB-1622F2AA: SCORED 1.5656 s (best; slabs+ring+v3 confirmed TLB/latency hypothesis) |
 | Sat 20:34 | 0f3742b | + huge-page SmallMap/dedup/name/UF/sort buffers, deadlock fix, interleaved counters | BB-9462F329: SCORED 1.4784 s (best) |
-| Sat 21:04 | e62793b | PGO build (own traingen) + single-pass person radix + F3 SWAR + hash-once rings + dedup hash ring | BB-083322C0 queued |
+| Sat 21:04 | e62793b | PGO build (own traingen) + single-pass person radix + F3 SWAR + hash-once rings + dedup hash ring | BB-083322C0: SCORED 1.4165 s (best; PGO build works on scorer) |
