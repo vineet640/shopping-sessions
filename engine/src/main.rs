@@ -393,9 +393,11 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     }
     if n == 20 || n == 25 {
         if f[4] == b'-' {
-            let w0 = u64::from_le_bytes(f[0..8].try_into().unwrap());
-            let w1 = u64::from_le_bytes(f[8..16].try_into().unwrap());
-            let w2 = u32::from_le_bytes(f[16..20].try_into().unwrap()) as u64;
+            // n >= 20: fixed-offset unaligned loads, no bounds checks
+            let p = f.as_ptr();
+            let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            let w1 = unsafe { (p.add(8) as *const u64).read_unaligned() }.to_le();
+            let w2 = unsafe { (p.add(16) as *const u32).read_unaligned() }.to_le() as u64;
             if (w0 >> 56) as u8 != b'-' || (w1 >> 16) as u8 != b'T' || (w1 >> 40) as u8 != b':' || w2 as u8 != b':' {
                 return None;
             }
@@ -418,7 +420,8 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
             }
             let yi = y - dc.ybase;
             let day = if (0..DC_YEARS).contains(&yi) && (1..=12).contains(&mo) && (1..=31).contains(&d) && !dc.days.is_empty() {
-                let v = dc.days[(yi * 372 + (mo - 1) * 31 + (d - 1)) as usize];
+                // index < DC_YEARS * 372 = days.len() by the range checks above
+                let v = unsafe { *dc.days.get_unchecked((yi * 372 + (mo - 1) * 31 + (d - 1)) as usize) };
                 if v == i32::MIN {
                     return None;
                 }
@@ -427,7 +430,7 @@ fn parse_ts(f: &[u8], dc: &mut DateCache) -> Option<i64> {
                 parse_date(f)?
             };
             let off = if n == 20 {
-                if f[19] != b'Z' {
+                if (w2 >> 24) as u8 != b'Z' {
                     return None;
                 }
                 0
